@@ -31,14 +31,17 @@ class AppRepository(context: Context) {
     val idxUniverse = IdxUniverseRepository()
     val telegram = TelegramRepository()
     val secrets = SecureStore(context)
-    val stockbit = StockbitRepository(secrets, windowStore = object : BrokerWindowStore {
+    private val cacheStore = object : BrokerWindowStore {
         override suspend fun read(key: String): String? =
             db.cacheDao().broker(key, System.currentTimeMillis())?.payload
         override suspend fun write(key: String, ticker: String, payload: String, ttlMs: Long) {
             val now = System.currentTimeMillis()
-            db.cacheDao().upsertBroker(BrokerCacheEntity(key, ticker, "BROKER_WINDOW", payload, now, now + ttlMs))
+            db.cacheDao().upsertBroker(BrokerCacheEntity(key, ticker, if (ticker == "IDX") "IDX_DAILY" else "BROKER_WINDOW", payload, now, now + ttlMs))
         }
-    })
+    }
+    val stockbit = StockbitRepository(secrets, windowStore = cacheStore)
+    /** Market-wide daily OHLCV + foreign flow from IDX (one request per session for all stocks). */
+    val idxDaily = IdxStockSummaryRepository(cacheStore)
 
     val signals: Flow<List<SignalEntity>> = db.signalDao().observeAll()
     val latestScreening: Flow<List<ScreeningResultEntity>> = db.screeningDao().observeLatest()
@@ -161,7 +164,7 @@ class AppRepository(context: Context) {
     suspend fun saveScreening(batchId: String, candidates: List<Candidate>, checked: Int, passed: Int, coverageStatus: String) {
         val now = System.currentTimeMillis()
         val ranked = candidates.groupBy { it.strategy }.flatMap { (_, rows) ->
-            rows.sortedByDescending { it.strategyScore }.take(5).mapIndexed { index, candidate -> index + 1 to candidate }
+            rows.sortedWith(compareByDescending<Candidate> { it.passed }.thenByDescending { it.strategyScore }).take(5).mapIndexed { index, candidate -> index + 1 to candidate }
         }
         val screeningRows = ranked.map { (rank, c) ->
             ScreeningResultEntity("$batchId-${c.strategy.name}-${c.ticker}", batchId, now, c.referenceDate, rank, c.ticker, c.companyName,
@@ -170,7 +173,9 @@ class AppRepository(context: Context) {
         }
         db.withTransaction {
             db.screeningDao().insertAll(screeningRows)
-            ranked.forEach { (_, candidate) -> upsertSignalSnapshot(candidate) }
+            // Only broker-verified candidates become tracked signals. Provisional rows
+            // (broker not yet verified) are shown in the screener but never tracked or sent.
+            ranked.filter { (_, candidate) -> candidate.passed }.forEach { (_, candidate) -> upsertSignalSnapshot(candidate) }
         }
     }
 
@@ -209,6 +214,7 @@ class AppRepository(context: Context) {
     suspend fun sendSignal(screeningId: String, forceResend: Boolean = false): SendOutcome {
         val row = db.screeningDao().get(screeningId) ?: return SendOutcome.Failed("Hasil screening tidak ditemukan.")
         val candidate = runCatching { CandidateJson.decode(JSONObject(row.candidateJson)) }.getOrElse { return SendOutcome.Failed("Snapshot screening rusak.") }
+        if (!candidate.passed) return SendOutcome.Failed("Kandidat sementara: broker Stockbit belum terverifikasi, jadi tidak dikirim sebagai sinyal.")
         val uuid = candidate.signalUuid()
         val existing = db.signalDao().get(uuid)
         if (existing?.telegramSent == true && !forceResend) return SendOutcome.AlreadySent

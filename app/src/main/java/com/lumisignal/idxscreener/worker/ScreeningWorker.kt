@@ -90,6 +90,7 @@ class ScreeningWorker(context: Context, params: WorkerParameters) : CoroutineWor
             repo.log("IDX universe loaded", "${snapshot.totalCount} instrumen; ${universe.size} saham biasa diperiksa")
 
             repo.purgeExpiredCache()
+            repo.stockbit.resetBrokerHealth()
             val startedAt = System.currentTimeMillis()
             val trafficBefore = repo.stockbit.trafficStats()
             val noBroker = BrokerAnalysis(
@@ -97,74 +98,124 @@ class ScreeningWorker(context: Context, params: WorkerParameters) : CoroutineWor
                 explanation = listOf("Broker summary belum diambil pada tahap awal"),
                 failureKind = BrokerFailureKind.UNKNOWN
             )
+            val publishMutex = kotlinx.coroutines.sync.Mutex()
+            var lastPublish = 0L
+            suspend fun throttledPublish(message: String, current: Int, total: Int, force: Boolean = false, update: (ScreeningRunEntity) -> ScreeningRunEntity = { it }) {
+                if (!force && System.currentTimeMillis() - lastPublish < PROGRESS_INTERVAL_MS) return
+                publishMutex.withLock {
+                    if (!force && System.currentTimeMillis() - lastPublish < PROGRESS_INTERVAL_MS) return@withLock
+                    lastPublish = System.currentTimeMillis()
+                    publish(message, current, total, update)
+                }
+            }
 
-            // ---- Pipelined stages -------------------------------------------------------
-            // OHLCVF sync (general lane) feeds the broker pipeline (broker lane) as soon as a
-            // ticker passes the technical upper-bound prefilter, so both Stockbit lanes work at
-            // the same time instead of one stage idling while the other finishes. Workers pull
-            // from a shared queue, so one slow ticker no longer blocks a whole chunk.
+            // ---- Stage 1: daily OHLCVF ------------------------------------------------------
+            // Primary source: IDX market-wide daily summary (one request per session for every
+            // stock, cached). Stockbit per-ticker history is only the fallback.
             val seriesByTicker = ConcurrentHashMap<String, MarketSeries>()
             val checked = AtomicInteger(0)
             val technicalFailures = AtomicInteger(0)
-            val latestEpoch = java.util.concurrent.atomic.AtomicLong(0L)
-            val potentialTickers = ConcurrentHashMap.newKeySet<String>()
-            val brokerQueue = kotlinx.coroutines.channels.Channel<MarketSeries>(kotlinx.coroutines.channels.Channel.UNLIMITED)
+            val names = universe.associate { it.ticker to it.companyName }
+            var foreignByTicker: Map<String, List<Pair<java.time.LocalDate, Double>>> = emptyMap()
+            var seriesSource = "STOCKBIT"
+            publish("Mengunduh ringkasan harian IDX (seluruh pasar)...", 0, 72)
+            when (val idx = withTimeoutOrNull(IDX_STAGE_TIMEOUT_MS) {
+                repo.idxDaily.buildSeries(names) { done: Int, target: Int -> throttledPublish("Ringkasan harian IDX $done/$target sesi", done, target) }
+            }) {
+                is DataResult.Success -> {
+                    universe.forEach { item -> idx.value.series[item.ticker]?.let { seriesByTicker[item.ticker] = it } }
+                    foreignByTicker = idx.value.foreignNet
+                    seriesSource = "IDX"
+                    repo.log("Data harian IDX dipakai", "${seriesByTicker.size}/${universe.size} saham • ${idx.value.sessions.size} sesi • ${idx.value.networkRequests} request jaringan")
+                }
+                is DataResult.Error -> repo.log("Data harian IDX tidak tersedia, beralih ke Stockbit", idx.userMessage, "WARN")
+                null -> repo.log("Data harian IDX timeout, beralih ke Stockbit", null, "WARN")
+            }
+            val missing = universe.filter { !seriesByTicker.containsKey(it.ticker) }
+            // With IDX data only a handful of tickers (new listings, suspensions) still need
+            // Stockbit; without it this is the original per-ticker sync.
+            checked.set(universe.size - missing.size)
+            val technicalCompleted = withTimeoutOrNull(MARKET_STAGE_TIMEOUT_MS) {
+                val next = AtomicInteger(0)
+                coroutineScope {
+                    repeat(minOf(STOCKBIT_CONCURRENCY, missing.size)) {
+                        launch(Dispatchers.IO) {
+                            while (true) {
+                                val item = missing.getOrNull(next.getAndIncrement()) ?: break
+                                try {
+                                    when (val data = withTimeoutOrNull(STOCKBIT_TICKER_TIMEOUT_MS) { repo.screeningSeries(item.ticker, item.companyName) }) {
+                                        is DataResult.Success -> seriesByTicker[item.ticker] = data.value
+                                        else -> technicalFailures.incrementAndGet()
+                                    }
+                                } finally {
+                                    checked.incrementAndGet()
+                                    throttledPublish("OHLCVF ${checked.get()}/${universe.size}", checked.get(), universe.size) {
+                                        it.copy(technicalAttempted = checked.get(), technicalValid = seriesByTicker.size, technicalFailed = technicalFailures.get())
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                true
+            } ?: false
+            if (!technicalCompleted) repo.log("Tahap OHLCVF mencapai batas waktu", "${checked.get()}/${universe.size} selesai", "WARN")
+            if (seriesByTicker.isEmpty()) return fail("Tidak ada ticker dengan minimal 60 sesi OHLCVF.", checked.get(), universe.size)
 
+            val referenceEpoch = seriesByTicker.values.maxOf { it.candles.last().epochSeconds }
+            val activeSeries = seriesByTicker.values.filter { it.candles.last().epochSeconds == referenceEpoch }
+            val activeTickers = activeSeries.map { it.ticker }.toSet()
+            val staleExcluded = seriesByTicker.size - activeSeries.size
+
+            // ---- Stage 2: technical ranking ---------------------------------------------------
+            // Upper-bound filter (missing broker criteria count as satisfiable), then rank by the
+            // strongest technical reading so the scarce broker budget goes to the best setups first.
+            val technicalRank = activeSeries.mapNotNull { series ->
+                val potentials = StrategyEngine.analyze(series, noBroker).filter { it.potentiallyEligible }
+                if (potentials.isEmpty()) null else series to potentials.maxOf { it.matchedCriteria * 10.0 + it.strategyScore / 10.0 }
+            }.sortedByDescending { it.second }.map { it.first }
+            publish("${technicalRank.size} saham lolos prefilter teknikal", technicalRank.size, activeSeries.size) {
+                it.copy(technicalAttempted = checked.get(), technicalValid = seriesByTicker.size, technicalFailed = technicalFailures.get(),
+                    staleExcluded = staleExcluded, referenceDate = referenceEpoch)
+            }
+
+            // ---- Stage 3: budgeted broker verification ----------------------------------------
             val seedByTicker = ConcurrentHashMap<String, BrokerAnalysis>()
             val seedChecked = AtomicInteger(0)
             val seedValid = AtomicInteger(0)
             val detailStarted = AtomicInteger(0)
             val detailChecked = AtomicInteger(0)
             val detailValid = AtomicInteger(0)
-            // ConcurrentHashMap rejects null values, so a completed detail is stored as Optional.empty().
+            // ConcurrentHashMap rejects null values, so a completed detail is Optional.empty().
             val detailOutcome = ConcurrentHashMap<String, java.util.Optional<BrokerFailureKind>>()
             val contextLimited = ConcurrentHashMap.newKeySet<String>()
             val enrichedByTicker = ConcurrentHashMap<String, List<Candidate>>()
-            val staleSkipped = AtomicInteger(0)
-            val technicalDone = java.util.concurrent.atomic.AtomicBoolean(false)
+            val bestBroker = ConcurrentHashMap<String, BrokerAnalysis>()
+            val brokerStageStart = System.currentTimeMillis()
+            val stopReason = java.util.concurrent.atomic.AtomicReference<String?>(null)
 
-            val publishMutex = kotlinx.coroutines.sync.Mutex()
-            var lastPublish = 0L
-            suspend fun progress(force: Boolean = false) {
-                val now = System.currentTimeMillis()
-                if (!force && now - lastPublish < PROGRESS_INTERVAL_MS) return
-                publishMutex.withLock {
-                    if (!force && System.currentTimeMillis() - lastPublish < PROGRESS_INTERVAL_MS) return@withLock
-                    lastPublish = System.currentTimeMillis()
-                    val brokerPart = "broker seed ${seedChecked.get()}/${potentialTickers.size} • detail ${detailChecked.get()}/${detailStarted.get()}"
-                    val (message, current, total) = if (!technicalDone.get()) {
-                        Triple("OHLCVF ${checked.get()}/${universe.size} • $brokerPart", checked.get(), universe.size)
-                    } else {
-                        val total = potentialTickers.size + detailStarted.get()
-                        Triple("Analisis broker • $brokerPart", seedChecked.get() + detailChecked.get(), total)
-                    }
-                    publish(message, current, total) {
-                        it.copy(
-                            technicalAttempted = checked.get(), technicalValid = seriesByTicker.size, technicalFailed = technicalFailures.get(),
-                            brokerSeedAttempted = seedChecked.get(), brokerSeedValid = seedValid.get(), brokerSeedFailed = seedChecked.get() - seedValid.get(),
-                            detailAttempted = detailChecked.get(), detailValid = detailValid.get(), detailFailed = detailChecked.get() - detailValid.get()
-                        )
-                    }
-                }
+            suspend fun brokerProgress(force: Boolean = false) = throttledPublish(
+                "Verifikasi broker • seed ${seedChecked.get()}/${technicalRank.size} • detail ${detailChecked.get()}/${detailStarted.get()}",
+                seedChecked.get(), technicalRank.size, force
+            ) {
+                it.copy(brokerSeedAttempted = seedChecked.get(), brokerSeedValid = seedValid.get(), brokerSeedFailed = seedChecked.get() - seedValid.get(),
+                    detailAttempted = detailChecked.get(), detailValid = detailValid.get(), detailFailed = detailChecked.get() - detailValid.get())
             }
 
             suspend fun brokerPipeline(series: MarketSeries) {
                 val ticker = series.ticker
-                val lastEpoch = series.candles.last().epochSeconds
-                // A newer session has already been seen for other tickers: this one is stale and
-                // would be excluded anyway, so do not spend broker requests on it.
-                if (lastEpoch < latestEpoch.get()) { staleSkipped.incrementAndGet(); return }
                 val seed = try {
                     withTimeoutOrNull(BROKER_SEED_TICKER_TIMEOUT_MS) {
                         repo.brokerSeedAnalysis(ticker, series.candles.map { it.epochSeconds })
                     } ?: BrokerAnalysis(false, explanation = listOf("Broker seed timeout"), failureKind = BrokerFailureKind.TIMEOUT)
                 } finally { seedChecked.incrementAndGet() }
                 seedByTicker[ticker] = seed
-                if (!seed.available) { progress(); return }
+                if (!seed.available) { brokerProgress(); return }
                 seedValid.incrementAndGet()
+                bestBroker[ticker] = seed
 
                 val strategies = StrategyEngine.analyze(series, seed).filter { it.potentiallyEligible }.map { it.strategy }.toSet()
-                if (strategies.isEmpty()) { progress(); return }
+                if (strategies.isEmpty()) { brokerProgress(); return }
                 detailStarted.incrementAndGet()
                 try {
                     val needsEventWindow = StrategyType.ABSORPTION_AT_SUPPORT in strategies || StrategyType.SHAKEOUT_SPRING_RECLAIM in strategies
@@ -177,7 +228,6 @@ class ScreeningWorker(context: Context, params: WorkerParameters) : CoroutineWor
                     ) }
                     val expectedDailySessions = if (needsEventWindow) 20 else if (needsDailyPersistence) 10 else 0
                     val (broker, market) = coroutineScope {
-                        // Market gates (general lane) and broker history (broker lane) in parallel.
                         val marketAsync = async { withTimeoutOrNull(MARKET_CONTEXT_TIMEOUT_MS) { repo.stockbit.fetchMarketContext(ticker, includeExtended = false) } }
                         val brokerResult = withTimeoutOrNull(BROKER_TICKER_TIMEOUT_MS) {
                             when {
@@ -206,115 +256,117 @@ class ScreeningWorker(context: Context, params: WorkerParameters) : CoroutineWor
                     } else {
                         detailOutcome[ticker] = java.util.Optional.of(broker.failureKind ?: BrokerFailureKind.UNKNOWN)
                     }
+                    if (broker.available) bestBroker[ticker] = broker
                     if (!contextComplete) contextLimited += ticker
                     enrichedByTicker[ticker] = StrategyEngine.analyze(series, broker, market)
                 } finally {
                     detailChecked.incrementAndGet()
-                    progress()
+                    brokerProgress()
                 }
             }
 
-            var technicalCompleted = true
-            var brokerCompleted = true
-            coroutineScope {
-                val brokerWorkers = launch {
-                    brokerCompleted = withTimeoutOrNull(BROKER_STAGE_TIMEOUT_MS) {
-                        coroutineScope {
-                            repeat(BROKER_TICKER_CONCURRENCY) {
-                                launch(Dispatchers.IO) {
-                                    for (series in brokerQueue) {
-                                        try {
-                                            brokerPipeline(series)
-                                        } catch (e: CancellationException) {
-                                            throw e
-                                        } catch (e: Throwable) {
-                                            // One malformed ticker must not abort the market-wide run.
-                                            detailOutcome.putIfAbsent(series.ticker, java.util.Optional.of(BrokerFailureKind.UNKNOWN))
-                                            repo.log("Analisis broker ${series.ticker} gagal", e.message ?: e.javaClass.simpleName, "WARN")
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        true
-                    } ?: false
+            fun shouldStop(): Boolean {
+                if (stopReason.get() != null) return true
+                val reason = when {
+                    repo.stockbit.brokerDegraded() -> "Stockbit membatasi broker summary (respons kosong/429 beruntun)"
+                    System.currentTimeMillis() - brokerStageStart > BROKER_TIME_BUDGET_MS -> "batas waktu verifikasi broker ${BROKER_TIME_BUDGET_MS / 60_000} menit tercapai"
+                    else -> null
                 }
-                technicalCompleted = withTimeoutOrNull(MARKET_STAGE_TIMEOUT_MS) {
-                    val next = AtomicInteger(0)
-                    coroutineScope {
-                        repeat(minOf(STOCKBIT_CONCURRENCY, universe.size)) {
-                            launch(Dispatchers.IO) {
-                                while (true) {
-                                    val item = universe.getOrNull(next.getAndIncrement()) ?: break
-                                    try {
-                                        when (val data = withTimeoutOrNull(STOCKBIT_TICKER_TIMEOUT_MS) { repo.screeningSeries(item.ticker, item.companyName) }) {
-                                            is DataResult.Success -> {
-                                                val series = data.value
-                                                seriesByTicker[item.ticker] = series
-                                                latestEpoch.accumulateAndGet(series.candles.last().epochSeconds, ::maxOf)
-                                                // Upper-bound filter: missing broker criteria count as satisfiable, so
-                                                // nothing that could still pass is discarded before broker data arrives.
-                                                if (StrategyEngine.analyze(series, noBroker).any { it.potentiallyEligible }) {
-                                                    potentialTickers += item.ticker
-                                                    brokerQueue.send(series)
-                                                }
-                                            }
-                                            else -> technicalFailures.incrementAndGet()
-                                        }
-                                    } finally {
-                                        checked.incrementAndGet()
-                                        progress()
-                                    }
+                if (reason != null) stopReason.compareAndSet(null, reason)
+                return reason != null
+            }
+
+            val brokerCompleted = withTimeoutOrNull(BROKER_TIME_BUDGET_MS + 3 * 60_000L) {
+                val next = AtomicInteger(0)
+                coroutineScope {
+                    repeat(minOf(BROKER_TICKER_CONCURRENCY, technicalRank.size)) {
+                        launch(Dispatchers.IO) {
+                            while (!shouldStop()) {
+                                val series = technicalRank.getOrNull(next.getAndIncrement()) ?: break
+                                try {
+                                    brokerPipeline(series)
+                                } catch (e: CancellationException) {
+                                    throw e
+                                } catch (e: Throwable) {
+                                    // One malformed ticker must not abort the market-wide run.
+                                    detailOutcome.putIfAbsent(series.ticker, java.util.Optional.of(BrokerFailureKind.UNKNOWN))
+                                    repo.log("Analisis broker ${series.ticker} gagal", e.message ?: e.javaClass.simpleName, "WARN")
                                 }
                             }
                         }
                     }
-                    true
-                } ?: false
-                technicalDone.set(true)
-                brokerQueue.close()
-                progress(force = true)
-                brokerWorkers.join()
-            }
-            if (!technicalCompleted) repo.log("Tahap OHLCVF mencapai batas waktu", "${checked.get()}/${universe.size} selesai", "WARN")
-            if (!brokerCompleted) repo.log("Tahap broker Stockbit mencapai batas waktu", "hasil yang selesai ditandai parsial", "WARN")
-            if (seriesByTicker.isEmpty()) return fail("Tidak ada ticker dengan minimal 60 sesi OHLCVF Stockbit.", checked.get(), universe.size)
+                }
+                stopReason.get() == null
+            } ?: false
+            stopReason.get()?.let { repo.log("Verifikasi broker dihentikan lebih awal", "$it • ${seedChecked.get()}/${technicalRank.size} kandidat diperiksa", "WARN") }
+            brokerProgress(force = true)
 
-            // ---- Final accounting on active (non-stale) tickers only ----------------------
-            val referenceEpoch = seriesByTicker.values.maxOf { it.candles.last().epochSeconds }
-            val activeTickers = seriesByTicker.values.filter { it.candles.last().epochSeconds == referenceEpoch }.map { it.ticker }.toSet()
-            val staleExcluded = seriesByTicker.size - activeTickers.size
-            val activePotential = potentialTickers.filter { it in activeTickers }
-            val seedResults = activePotential.mapNotNull { seedByTicker[it] }
+            // ---- Stage 4: verified Top 5, then clearly-labelled provisional fill --------------
+            val verified = enrichedByTicker.values.flatten()
+            val verifiedTop = StrategyType.entries.flatMap { StrategyEngine.top(verified, it, 5) }
+            val provisional = mutableListOf<Candidate>()
+            val verifiedKeys = verifiedTop.map { it.ticker to it.strategy }.toSet()
+            for (series in technicalRank) {
+                val ticker = series.ticker
+                val broker = bestBroker[ticker] ?: noBroker
+                val reason = when {
+                    detailOutcome[ticker]?.isPresent == true -> "detail broker gagal (${detailOutcome[ticker]?.get()?.label})"
+                    seedByTicker[ticker]?.available == false -> "broker Stockbit ${seedByTicker[ticker]?.failureKind?.label ?: "tidak tersedia"}"
+                    seedByTicker[ticker] == null -> "belum diperiksa (${stopReason.get() ?: "di luar prioritas"})"
+                    else -> "broker belum lengkap"
+                }
+                val foreignLine = foreignByTicker[ticker]?.let { flows ->
+                    val f5 = flows.takeLast(5).sumOf { it.second }
+                    val f10 = flows.takeLast(10).sumOf { it.second }
+                    "Foreign flow IDX 5D ${compactIdr(f5)} • 10D ${compactIdr(f10)}"
+                }
+                StrategyEngine.analyze(series, broker).forEach { c ->
+                    if (c.passed || !c.potentiallyEligible || (c.ticker to c.strategy) in verifiedKeys) return@forEach
+                    val unavailable = c.criteria.count { it.state == CriterionState.DATA_UNAVAILABLE }
+                    if (unavailable > PROVISIONAL_MAX_UNAVAILABLE) return@forEach
+                    provisional += c.copy(
+                        calculationComplete = false,
+                        why = listOfNotNull("⚠ KANDIDAT SEMENTARA — $reason. Bukan sinyal; konfirmasi broker di Stockbit sebelum entry.", foreignLine) + c.why,
+                        dataLimitations = listOf("Broker Stockbit belum terverifikasi: $reason") + c.dataLimitations
+                    )
+                }
+            }
+            val provisionalTop = StrategyType.entries.flatMap { strategy ->
+                val room = 5 - verifiedTop.count { it.strategy == strategy }
+                if (room <= 0) emptyList()
+                else provisional.filter { it.strategy == strategy }
+                    .sortedWith(compareByDescending<Candidate> { it.matchedCriteria }.thenByDescending { it.strategyScore }.thenBy { it.ticker })
+                    .take(room)
+            }
+            val saved = verifiedTop + provisionalTop
+
+            // ---- Final accounting -------------------------------------------------------------
+            val seedResults = technicalRank.mapNotNull { seedByTicker[it.ticker] }
             val seedValidCount = seedResults.count { it.available }
-            val seedFailedCount = activePotential.size - seedValidCount
+            val seedFailedCount = technicalRank.size - seedValidCount
             val detailTickers = detailOutcome.keys.filter { it in activeTickers }
             val detailValidCount = detailTickers.count { detailOutcome[it]?.isPresent == false }
             val detailFailedCount = detailTickers.size - detailValidCount
-            val enriched = enrichedByTicker.filterKeys { it in activeTickers }.values.flatten()
-
-            val saved = StrategyType.entries.flatMap { StrategyEngine.top(enriched, it, 5) }
             val complete = technicalCompleted && brokerCompleted && checked.get() == universe.size && technicalFailures.get() == 0 &&
-                seedResults.size == activePotential.size && seedFailedCount == 0 && detailFailedCount == 0
+                seedResults.size == technicalRank.size && seedFailedCount == 0 && detailFailedCount == 0
             val coverage = if (complete) "COMPLETE" else "PARTIAL"
             repo.saveScreening(runId, saved, checked.get(), detailValidCount, coverage)
-            val counts = StrategyType.entries.joinToString { strategy -> "${strategy.number}:${saved.count { it.strategy == strategy }}" }
+            val counts = StrategyType.entries.joinToString { strategy -> "${strategy.number}:${verifiedTop.count { it.strategy == strategy }}+${provisionalTop.count { it.strategy == strategy }}" }
             fun failureSummary(values: List<BrokerFailureKind>): String = values.groupingBy { it }.eachCount().entries
                 .sortedBy { it.key.ordinal }
                 .joinToString { "${it.key.label} ${it.value}" }
-            val notAttempted = activePotential.size - seedResults.size
+            val notAttempted = technicalRank.size - seedResults.size
             val diagnostics = buildList {
                 val seedKinds = seedResults.filter { !it.available }.map { it.failureKind ?: BrokerFailureKind.UNKNOWN }
                 failureSummary(seedKinds).takeIf { it.isNotBlank() }?.let { add("seed: $it") }
-                if (notAttempted > 0) add("seed belum diproses $notAttempted")
+                if (notAttempted > 0) add("broker belum diperiksa $notAttempted${stopReason.get()?.let { " ($it)" }.orEmpty()}")
                 failureSummary(detailTickers.mapNotNull { detailOutcome[it]?.orElse(null) }).takeIf { it.isNotBlank() }?.let { add("detail: $it") }
-                val limited = contextLimited.count { it in activeTickers }
-                if (limited > 0) add("konteks opsional belum lengkap $limited")
             }.joinToString(" • ")
             val elapsedSeconds = (System.currentTimeMillis() - startedAt) / 1000
             val duration = "%d:%02d".format(elapsedSeconds / 60, elapsedSeconds % 60)
-            val finalMessage = if (complete) "Screening lengkap ($duration). ${saved.size} kandidat valid di 10 strategi."
-                else "Screening parsial ($duration). ${saved.size} kandidat valid${if (diagnostics.isBlank()) "." else " • $diagnostics"}"
+            val summary = "${verifiedTop.size} kandidat terverifikasi + ${provisionalTop.size} sementara"
+            val finalMessage = if (complete) "Screening lengkap ($duration, data $seriesSource). $summary."
+                else "Screening parsial ($duration, data $seriesSource). $summary${if (diagnostics.isBlank()) "." else " • $diagnostics"}"
             publish(finalMessage, checked.get(), universe.size) {
                 it.copy(
                     status = coverage, completedAt = System.currentTimeMillis(), candidateCount = saved.size,
@@ -330,11 +382,10 @@ class ScreeningWorker(context: Context, params: WorkerParameters) : CoroutineWor
             val traffic = repo.stockbit.trafficStats()
             repo.log(
                 "Screening 10 strategi selesai",
-                "$coverage • $duration • ${checked.get()}/${universe.size} OHLCVF • seed $seedValidCount/${activePotential.size} • detail $detailValidCount/${detailTickers.size} • " +
-                    "request umum ${traffic.generalCompleted - trafficBefore.generalCompleted}, broker ${traffic.brokerCompleted - trafficBefore.brokerCompleted}, " +
+                "$coverage • $duration • data $seriesSource • ${seriesByTicker.size}/${universe.size} OHLCVF • seed $seedValidCount/${technicalRank.size} • detail $detailValidCount/${detailTickers.size} • " +
+                    "request broker ${traffic.brokerCompleted - trafficBefore.brokerCompleted}, umum ${traffic.generalCompleted - trafficBefore.generalCompleted}, " +
                     "429 ${traffic.rateLimitHits - trafficBefore.rateLimitHits}, challenge ${traffic.challengeHits - trafficBefore.challengeHits}, " +
-                    "kosong ${traffic.emptyResponses - trafficBefore.emptyResponses} (pulih ${traffic.emptyRecovered - trafficBefore.emptyRecovered}), " +
-                    "jeda broker ${traffic.brokerSpacingMs}ms • Top [$counts]"
+                    "kosong ${traffic.emptyResponses - trafficBefore.emptyResponses} (pulih ${traffic.emptyRecovered - trafficBefore.emptyRecovered}) • Top [$counts]"
             )
             if (traffic.emptyResponses > trafficBefore.emptyResponses) {
                 repo.log("Contoh respons broker kosong Stockbit", traffic.lastEmptySample ?: "-", "WARN")
@@ -375,14 +426,28 @@ class ScreeningWorker(context: Context, params: WorkerParameters) : CoroutineWor
         private const val MARKET_STAGE_TIMEOUT_MS = 45 * 60_000L
         // Per-ticker limits are generous on purpose: queueing behind the adaptive request lanes
         // is not a failure. Real network failures surface through the per-request retry policy.
-        private const val BROKER_SEED_TICKER_TIMEOUT_MS = 3 * 60_000L
-        private const val BROKER_TICKER_TIMEOUT_MS = 6 * 60_000L
+        private const val BROKER_SEED_TICKER_TIMEOUT_MS = 90_000L
+        private const val BROKER_TICKER_TIMEOUT_MS = 3 * 60_000L
         private const val MARKET_CONTEXT_TIMEOUT_MS = 60_000L
-        private const val BROKER_STAGE_TIMEOUT_MS = 85 * 60_000L
         private const val STOCKBIT_CONNECTION_TIMEOUT_MS = 25_000L
         private const val STOCKBIT_CONCURRENCY = 8
-        private const val BROKER_TICKER_CONCURRENCY = 6
+        private const val BROKER_TICKER_CONCURRENCY = 3
         private const val PROGRESS_INTERVAL_MS = 1_200L
+        private const val IDX_STAGE_TIMEOUT_MS = 6 * 60_000L
+        /** Broker verification never holds the run hostage: whatever is not verified in time is provisional. */
+        private const val BROKER_TIME_BUDGET_MS = 8 * 60_000L
+        private const val PROVISIONAL_MAX_UNAVAILABLE = 2
+
+        private fun compactIdr(value: Double): String {
+            val abs = kotlin.math.abs(value)
+            val sign = if (value < 0) "-" else "+"
+            return when {
+                abs >= 1e12 -> "${sign}Rp%.2fT".format(abs / 1e12)
+                abs >= 1e9 -> "${sign}Rp%.1fM".format(abs / 1e9)
+                abs >= 1e6 -> "${sign}Rp%.0fjt".format(abs / 1e6)
+                else -> "${sign}Rp%.0f".format(abs)
+            }
+        }
         private const val SCREENING_CHANNEL = "lumi_screening"
         private const val SCREENING_NOTIFICATION_ID = 7201
     }

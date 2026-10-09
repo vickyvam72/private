@@ -1137,6 +1137,25 @@ class StockbitRepository(
         return window
     }
 
+    private val brokerOutcomes = ArrayDeque<Boolean>()
+
+    private fun recordBrokerOutcome(ok: Boolean) = synchronized(brokerOutcomes) {
+        brokerOutcomes.addLast(ok)
+        while (brokerOutcomes.size > BROKER_HEALTH_WINDOW) brokerOutcomes.removeFirst()
+    }
+
+    /**
+     * Circuit breaker: Stockbit throttles the broker endpoint per account, first silently (HTTP 200
+     * with an empty list) and then with 429. When most recent answers are bad, more requests only
+     * make the run slower, so the screening worker stops asking for broker history.
+     */
+    fun brokerDegraded(): Boolean = synchronized(brokerOutcomes) {
+        brokerOutcomes.size >= BROKER_HEALTH_MIN_SAMPLES &&
+            brokerOutcomes.count { !it } >= brokerOutcomes.size * BROKER_HEALTH_BAD_RATIO
+    }
+
+    fun resetBrokerHealth() = synchronized(brokerOutcomes) { brokerOutcomes.clear() }
+
     private val emptyResponses = AtomicInteger(0)
     private val emptyRecovered = AtomicInteger(0)
     @Volatile private var lastEmptySample: String? = null
@@ -1156,9 +1175,11 @@ class StockbitRepository(
             val (window, raw) = requestBrokerWindow(symbol, from, to, investorType)
             if (window != null) {
                 if (attempt > 0) emptyRecovered.incrementAndGet()
+                recordBrokerOutcome(true)
                 return window
             }
             emptyResponses.incrementAndGet()
+            recordBrokerOutcome(false)
             lastEmptySample = "$symbol $from..$to $investorType: ${raw.take(EMPTY_SAMPLE_CHARS)}"
             if (investorType != "ALL") return null // FOREIGN can be legitimately empty
             brokerGate.onSoftThrottle()
@@ -1299,7 +1320,7 @@ class StockbitRepository(
         // Throttling is waited out on a time budget (the lane pauses for everyone), because a
         // Stockbit/Cloudflare cool-down can last longer than a handful of quick retries.
         val throttleBudgetMs = when (priority) {
-            StockbitRequestPriority.BROKER_HISTORY -> 150_000L
+            StockbitRequestPriority.BROKER_HISTORY -> 30_000L
             StockbitRequestPriority.SCREENING -> 90_000L
             else -> 20_000L
         }
@@ -1318,6 +1339,7 @@ class StockbitRepository(
                 throw e
             } catch (e: RateLimitException) {
                 gate.onRateLimited(e.retryAfterMs, e.challenge)
+                if (priority == StockbitRequestPriority.BROKER_HISTORY) recordBrokerOutcome(false)
                 throttled++
                 if (throttled >= 3 && System.currentTimeMillis() - startedAt > throttleBudgetMs) throw e
                 if (throttled >= 40) throw e
@@ -1433,7 +1455,10 @@ class StockbitRepository(
         private const val DAILY_RESERVE_SESSIONS = 6
         private const val LIVE_WINDOW_TTL_MS = 2 * 60_000L
         private const val EMPTY_WINDOW_TTL_MS = 60_000L
-        private val EMPTY_RETRY_DELAYS_MS = listOf(2_000L, 6_000L, 15_000L)
+        private val EMPTY_RETRY_DELAYS_MS = listOf(1_500L)
+        private const val BROKER_HEALTH_WINDOW = 20
+        private const val BROKER_HEALTH_MIN_SAMPLES = 12
+        private const val BROKER_HEALTH_BAD_RATIO = 0.6
         private const val EMPTY_SAMPLE_CHARS = 400
         private const val SETTLED_WINDOW_TTL_MS = 30L * 24 * 60 * 60_000L
         private const val HISTORICAL_PAGE_SIZE = 12
