@@ -1,0 +1,3 @@
+-keep class androidx.room.** { *; }
+-keep class com.lumisignal.idxscreener.data.** { *; }
+-dontwarn org.json.**

@@ -1,0 +1,10 @@
+<resources xmlns:tools="http://schemas.android.com/tools">
+    <style name="Theme.LumiSignal" parent="android:style/Theme.Material.NoActionBar">
+        <item name="android:fontFamily">sans</item>
+        <item name="android:windowLightStatusBar">false</item>
+        <item name="android:statusBarColor">@color/lumi_navy</item>
+        <item name="android:navigationBarColor">@color/lumi_navy</item>
+        <item name="android:windowSplashScreenBackground" tools:targetApi="31">@color/white</item>
+        <item name="android:windowSplashScreenAnimatedIcon" tools:targetApi="31">@drawable/lumi_logo</item>
+    </style>
+</resources>
