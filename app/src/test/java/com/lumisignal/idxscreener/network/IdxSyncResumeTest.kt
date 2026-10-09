@@ -59,7 +59,7 @@ class IdxSyncResumeTest {
         val callsBefore = fake.calls
         val second = IdxStockSummaryRepository(store, directOverride = fake::get, spacingMs = 0, backoffBaseMs = 1)
             .buildSeries(names, maxNetworkDays = 6)
-        assertTrue(second is DataResult.Success)
+        assertTrue((second as? DataResult.Error)?.userMessage ?: "", second is DataResult.Success)
         assertTrue("resumed run should need at most the newest unpublished days", fake.calls - callsBefore <= 6)
     }
 }

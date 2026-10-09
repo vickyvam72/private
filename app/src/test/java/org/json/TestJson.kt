@@ -106,6 +106,7 @@ class JSONArray {
     fun optLong(index: Int): Long = values.getOrNull(index)?.takeUnless { it === JSONObject.NULL }?.let(JSONObject::number)?.toLong() ?: 0L
     fun getJSONObject(index: Int): JSONObject = values[index] as JSONObject
     fun optJSONObject(index: Int): JSONObject? = values.getOrNull(index) as? JSONObject
+    fun optJSONArray(index: Int): JSONArray? = values.getOrNull(index) as? JSONArray
     override fun toString(): String = values.joinToString(",", "[", "]") { JSONObject.render(it) }
 }
 
