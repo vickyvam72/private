@@ -126,7 +126,7 @@ class ScreeningWorker(context: Context, params: WorkerParameters) : CoroutineWor
                     universe.forEach { item -> idx.value.series[item.ticker]?.let { seriesByTicker[item.ticker] = it } }
                     foreignByTicker = idx.value.foreignNet
                     seriesSource = "IDX"
-                    repo.log("Data harian IDX dipakai", "${seriesByTicker.size}/${universe.size} saham • ${idx.value.sessions.size} sesi • ${idx.value.networkRequests} request jaringan")
+                    repo.log("Data harian IDX dipakai", "${seriesByTicker.size}/${universe.size} saham • ${idx.value.sessions.size} sesi • ${idx.value.networkRequests} request jaringan • via ${repo.idxDaily.lastTransport}")
                 }
                 is DataResult.Error -> repo.log("Data harian IDX tidak tersedia, beralih ke Stockbit", idx.userMessage, "WARN")
                 null -> repo.log("Data harian IDX timeout, beralih ke Stockbit", null, "WARN")

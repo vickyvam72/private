@@ -51,9 +51,26 @@ data class IdxBulkResult(
  * the whole market cost ~80 requests the first time and about one request per day afterwards
  * (completed sessions are cached). This replaces ~850–5,000 per-ticker Stockbit requests.
  */
-class IdxStockSummaryRepository(private val store: BrokerWindowStore? = null) {
+/** A real browser engine that can read idx.co.id the way the website itself does. */
+interface IdxBrowserFetcher {
+    val lastTitle: String
+    suspend fun open()
+    suspend fun get(url: String): String
+    suspend fun close()
+}
+
+class IdxStockSummaryRepository(
+    private val store: BrokerWindowStore? = null,
+    private val browserFactory: (() -> IdxBrowserFetcher)? = null
+) {
     private val jakarta = ZoneId.of("Asia/Jakarta")
     private val sessionMutex = Mutex()
+    private val browserMutex = Mutex()
+    @Volatile private var browser: IdxBrowserFetcher? = null
+    @Volatile private var directBlocked = false
+    @Volatile private var browserFailure: Throwable? = null
+    @Volatile var lastTransport: String = "-"
+        private set
     @Volatile private var cookie: String? = null
     private val compact = DateTimeFormatter.BASIC_ISO_DATE
 
@@ -62,6 +79,9 @@ class IdxStockSummaryRepository(private val store: BrokerWindowStore? = null) {
         sessions: Int = 72,
         onProgress: suspend (done: Int, target: Int) -> Unit = { _, _ -> }
     ): DataResult<IdxBulkResult> = try {
+        directBlocked = false
+        browserFailure = null
+        lastTransport = "langsung"
         val now = ZonedDateTime.now(jakarta)
         val newest = StockbitSessionPolicy.completedDataBucket(now)
         val weekdays = generateSequence(newest) { it.minusDays(1) }.filter { it.dayOfWeek.value <= 5 }
@@ -113,7 +133,12 @@ class IdxStockSummaryRepository(private val store: BrokerWindowStore? = null) {
     } catch (e: CancellationException) {
         throw e
     } catch (e: Throwable) {
-        DataResult.Error("Ringkasan harian IDX tidak tersedia: ${e.message ?: e.javaClass.simpleName}", e)
+        DataResult.Error("Ringkasan harian IDX tidak tersedia ($lastTransport): ${e.message ?: e.javaClass.simpleName}", e)
+    } finally {
+        browserMutex.withLock {
+            browser?.let { runCatching { it.close() } }
+            browser = null
+        }
     }
 
     private data class LoadedDay(val rows: Map<String, IdxDailyRow>, val fromNetwork: Boolean)
@@ -127,9 +152,10 @@ class IdxStockSummaryRepository(private val store: BrokerWindowStore? = null) {
         }
         var rows: Map<String, IdxDailyRow>? = null
         var lastError: Throwable? = null
+        val url = "https://www.idx.co.id/primary/TradingSummary/GetStockSummary?length=9999&start=0&date=${date.format(compact)}"
         for (attempt in 0 until 3) {
             try {
-                rows = parseDay(request("https://www.idx.co.id/primary/TradingSummary/GetStockSummary?length=9999&start=0&date=${date.format(compact)}"))
+                rows = parseDay(fetch(url))
                 break
             } catch (e: CancellationException) {
                 throw e
@@ -165,6 +191,41 @@ class IdxStockSummaryRepository(private val store: BrokerWindowStore? = null) {
         }
         cookie = fetched
         fetched
+    }
+
+    /**
+     * Direct HTTP first (cheapest). Cloudflare answers idx.co.id API calls from non-browser clients
+     * with "Attention Required" (HTTP 403), so on the first such answer every later request goes
+     * through the hidden WebView, which loads IDX's own page and fetches from inside it.
+     */
+    private suspend fun fetch(url: String): String {
+        if (!directBlocked) {
+            try {
+                return request(url)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Throwable) {
+                val blocked = (e is HttpStatusException && e.status == 403) || (e is RateLimitException && e.challenge)
+                if (!blocked || browserFactory == null) throw e
+                directBlocked = true
+            }
+        }
+        val active = browserMutex.withLock {
+            browserFailure?.let { throw IOException("WebView IDX gagal: ${it.message}", it) }
+            browser ?: browserFactory!!.invoke().also { candidate ->
+                try {
+                    candidate.open()
+                } catch (e: Throwable) {
+                    runCatching { candidate.close() }
+                    if (e !is CancellationException) browserFailure = e
+                    lastTransport = "WebView gagal (${candidate.lastTitle.take(40)})"
+                    throw e
+                }
+                browser = candidate
+                lastTransport = "WebView (${candidate.lastTitle.take(40)})"
+            }
+        }
+        return active.get(url)
     }
 
     private suspend fun request(url: String): String {

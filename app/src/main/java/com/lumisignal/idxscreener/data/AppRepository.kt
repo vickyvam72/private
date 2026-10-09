@@ -41,7 +41,8 @@ class AppRepository(context: Context) {
     }
     val stockbit = StockbitRepository(secrets, windowStore = cacheStore)
     /** Market-wide daily OHLCV + foreign flow from IDX (one request per session for all stocks). */
-    val idxDaily = IdxStockSummaryRepository(cacheStore)
+    private val appContext = context.applicationContext
+    val idxDaily = IdxStockSummaryRepository(cacheStore) { IdxWebTransport(appContext) }
 
     val signals: Flow<List<SignalEntity>> = db.signalDao().observeAll()
     val latestScreening: Flow<List<ScreeningResultEntity>> = db.screeningDao().observeLatest()

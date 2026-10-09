@@ -17,3 +17,12 @@ and retrying only made the run slower. 1.13.0 stops depending on hundreds of tho
   with IDX foreign flow 5D/10D. They are shown as "BELUM LENGKAP", never ranked above verified rows,
   never stored as tracked signals and cannot be sent to Telegram.
 - CI probes the IDX endpoint and publishes `idx-probe.txt` with each build.
+
+## 1.13.1
+
+- Field run: idx.co.id answers direct HTTP clients with Cloudflare "Attention Required" (HTTP 403).
+  `IdxStockSummaryRepository` now switches to `IdxWebTransport` on the first 403/challenge: a hidden
+  WebView loads IDX's own "Ringkasan Saham" page (real Chromium, site cookies) and requests
+  `GetStockSummary` from inside the page with `fetch`, returning the JSON through a
+  `@JavascriptInterface` bridge (kept by R8). If the page itself stays blocked, the run falls back to
+  Stockbit OHLCVF as before. The activity log names the transport used.
