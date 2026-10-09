@@ -114,6 +114,32 @@ object StrategyEngine {
         }
     }
 
+    /**
+     * Coarse, deliberately generous prefilter for price-only sources (e.g. Yahoo Finance, which has
+     * no trade frequency or broker data). Missing frequency/broker inputs count as satisfiable, and
+     * [tolerance] extra criteria may miss, so a stock that could qualify on exact Stockbit data is not
+     * discarded merely because the coarse source differs slightly. Never used to rank or to pass.
+     */
+    fun prefilterCouldQualify(series: MarketSeries, tolerance: Int = 1): Boolean {
+        val candles = series.candles
+            .filter { it.close > 0 && it.high >= it.low && it.volume >= 0 }
+            .map(::adjustedCandle)
+            .sortedBy { it.epochSeconds }
+        if (candles.size < 60) return false
+        val metrics = metrics(candles)
+        val noBroker = BrokerAnalysis(false, explanation = listOf("prefilter"))
+        val mandatory = mandatoryCriteria(metrics, noBroker, null).map { criterion ->
+            if (!metrics.frequencyAvailable && criterion.state == CriterionState.MISS && criterion.label.contains("frekuensi", true))
+                criterion.copy(state = CriterionState.DATA_UNAVAILABLE) else criterion
+        }
+        if (mandatory.any { it.state == CriterionState.MISS }) return false
+        return StrategyType.entries.any { strategy ->
+            val criteria = strategyCriteria(strategy, metrics, noBroker)
+            val possible = criteria.count { it.state != CriterionState.MISS }
+            possible >= strategy.minimumMatches - tolerance
+        }
+    }
+
     fun top(candidates: List<Candidate>, strategy: StrategyType, limit: Int = 5): List<Candidate> =
         candidates.asSequence()
             .filter { it.strategy == strategy && it.passed }

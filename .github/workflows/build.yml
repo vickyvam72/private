@@ -42,12 +42,22 @@ jobs:
               -o day.json -w "$d %{http_code} %{size_download}\n" "https://www.idx.co.id/primary/TradingSummary/GetStockSummary?length=9999&start=0&date=$d" >> idx-probe.txt 2>&1 || true
             head -c 700 day.json >> idx-probe.txt; echo >> idx-probe.txt
           done
+      - name: Probe Yahoo Finance chart endpoint
+        if: always()
+        continue-on-error: true
+        run: |
+          UA='Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0 Mobile Safari/537.36'
+          for s in BBCA BBRI GOTO; do
+            curl -sS -A "$UA" -o y.json -w "$s %{http_code} %{size_download}\n" "https://query1.finance.yahoo.com/v8/finance/chart/$s.JK?range=6mo&interval=1d&includePrePost=false" >> yahoo-probe.txt 2>&1 || true
+            head -c 600 y.json >> yahoo-probe.txt; echo >> yahoo-probe.txt
+          done
       - name: Collect outputs
         if: always()
         run: |
           mkdir -p out
           cp build.log out/ || echo "no build.log" > out/build.log
           cp idx-probe.txt out/ 2>/dev/null || true
+          cp yahoo-probe.txt out/ 2>/dev/null || true
           cp app/build/outputs/apk/release/*.apk out/ 2>/dev/null || true
           cp app/build/outputs/apk/debug/*.apk out/ 2>/dev/null || true
           (cd app/build/test-results && zip -qr ../../../out/test-results.zip .) 2>/dev/null || true

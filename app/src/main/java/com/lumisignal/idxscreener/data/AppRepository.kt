@@ -41,6 +41,8 @@ class AppRepository(context: Context) {
     }
     val stockbit = StockbitRepository(secrets, windowStore = cacheStore)
     /** Market-wide daily OHLCV + foreign flow from IDX (one request per session for all stocks). */
+    /** Free price-only source used as a fast technical prefilter. */
+    val yahoo = YahooChartRepository()
     private val appContext = context.applicationContext
     val idxDaily = IdxStockSummaryRepository(cacheStore, browserFactory = { IdxWebTransport(appContext) })
 

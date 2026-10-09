@@ -148,7 +148,44 @@ class ScreeningWorker(context: Context, params: WorkerParameters) : CoroutineWor
                     }
                 }
             }
-            val missing = universe.filter { !seriesByTicker.containsKey(it.ticker) }
+            // Fast free prefilter: Yahoo Finance OHLCV (no frequency/broker) decides which stocks are
+            // worth a full Stockbit OHLCVF read. Generous by design (missing inputs count as possible,
+            // one extra miss tolerated); if Yahoo is unavailable every stock goes to Stockbit as before.
+            var stockbitUniverse = universe
+            var yahooSkipped = 0
+            if (seriesSource != "IDX") {
+                val yahooSeries = ConcurrentHashMap<String, MarketSeries>()
+                val yahooDone = AtomicInteger(0)
+                withTimeoutOrNull(YAHOO_STAGE_TIMEOUT_MS) {
+                    val nextYahoo = AtomicInteger(0)
+                    coroutineScope {
+                        repeat(minOf(YAHOO_CONCURRENCY, universe.size)) {
+                            launch(Dispatchers.IO) {
+                                while (true) {
+                                    val item = universe.getOrNull(nextYahoo.getAndIncrement()) ?: break
+                                    try {
+                                        val data = withTimeoutOrNull(YAHOO_TICKER_TIMEOUT_MS) { repo.yahoo.fetch(item.ticker, item.companyName) }
+                                        if (data is DataResult.Success) yahooSeries[item.ticker] = data.value
+                                    } finally {
+                                        yahooDone.incrementAndGet()
+                                        throttledPublish("Prefilter cepat Yahoo Finance ${yahooDone.get()}/${universe.size}", yahooDone.get(), universe.size)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                if (yahooSeries.size >= universe.size * 0.6) {
+                    stockbitUniverse = universe.filter { item ->
+                        yahooSeries[item.ticker]?.let { StrategyEngine.prefilterCouldQualify(it) } ?: true
+                    }
+                    yahooSkipped = universe.size - stockbitUniverse.size
+                    repo.log("Prefilter Yahoo Finance", "${yahooSeries.size}/${universe.size} saham terbaca • ${stockbitUniverse.size} diteruskan ke Stockbit • $yahooSkipped jelas tidak memenuhi syarat teknikal")
+                } else {
+                    repo.log("Yahoo Finance tidak memadai", "${yahooSeries.size}/${universe.size} saham terbaca; semua saham diambil dari Stockbit", "WARN")
+                }
+            }
+            val missing = stockbitUniverse.filter { !seriesByTicker.containsKey(it.ticker) }
             // With IDX data only a handful of tickers (new listings, suspensions) still need
             // Stockbit; without it this is the original per-ticker sync.
             checked.set(universe.size - missing.size)
@@ -399,7 +436,7 @@ class ScreeningWorker(context: Context, params: WorkerParameters) : CoroutineWor
             val traffic = repo.stockbit.trafficStats()
             repo.log(
                 "Screening 10 strategi selesai",
-                "$coverage • $duration • data $seriesSource • ${seriesByTicker.size}/${universe.size} OHLCVF • seed $seedValidCount/${technicalRank.size} • detail $detailValidCount/${detailTickers.size} • " +
+                "$coverage • $duration • data $seriesSource • ${seriesByTicker.size}/${universe.size} OHLCVF (prefilter Yahoo melewati $yahooSkipped) • seed $seedValidCount/${technicalRank.size} • detail $detailValidCount/${detailTickers.size} • " +
                     "request broker ${traffic.brokerCompleted - trafficBefore.brokerCompleted}, umum ${traffic.generalCompleted - trafficBefore.generalCompleted}, " +
                     "429 ${traffic.rateLimitHits - trafficBefore.rateLimitHits}, challenge ${traffic.challengeHits - trafficBefore.challengeHits}, " +
                     "kosong ${traffic.emptyResponses - trafficBefore.emptyResponses} (pulih ${traffic.emptyRecovered - trafficBefore.emptyRecovered}) • Top [$counts]"
@@ -452,6 +489,9 @@ class ScreeningWorker(context: Context, params: WorkerParameters) : CoroutineWor
         private const val BROKER_TICKER_CONCURRENCY = 3
         private const val PROGRESS_INTERVAL_MS = 1_200L
         private const val IDX_QUICK_TIMEOUT_MS = 2 * 60_000L
+        private const val YAHOO_STAGE_TIMEOUT_MS = 4 * 60_000L
+        private const val YAHOO_TICKER_TIMEOUT_MS = 20_000L
+        private const val YAHOO_CONCURRENCY = 8
         private const val IDX_QUICK_NETWORK_DAYS = 6
         private const val IDX_SEED_BUDGET_MS = 12 * 60_000L
         private const val IDX_SEED_GRACE_MS = 60_000L

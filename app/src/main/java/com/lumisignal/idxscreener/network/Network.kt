@@ -938,6 +938,7 @@ class StockbitRepository(
                 else previousWeekdays(reference, requestedSessions + 15)
 
             val windowsByDate = java.util.TreeMap<LocalDate, BrokerWindow>(Comparator.reverseOrder())
+            val emptyDates = mutableListOf<LocalDate>()
             var cursor = 0
             while (windowsByDate.size < requestedSessions && cursor < candidateDates.size) {
                 currentCoroutineContext().ensureActive()
@@ -947,11 +948,20 @@ class StockbitRepository(
                 val results = coroutineScope {
                     batch.map { date -> async { date to fetchWindowWithSecondChance(symbol, date, date, "ALL") } }.awaitAll()
                 }
-                results.forEach { (date, window) -> if (window != null) windowsByDate[date] = window }
+                results.forEach { (date, window) -> if (window != null) windowsByDate[date] = window else emptyDates += date }
             }
             val dailyWindows = windowsByDate.values.take(requestedSessions)
             if (dailyWindows.size < requestedSessions) {
-                return BrokerAnalysis(false, explanation = listOf("Broker summary harian Stockbit hanya tersedia ${dailyWindows.size}/$requestedSessions sesi untuk $symbol"), failureKind = BrokerFailureKind.INCOMPLETE)
+                val okDates = windowsByDate.keys.sortedDescending()
+                val pattern = if (okDates.isNotEmpty() && emptyDates.isNotEmpty() && emptyDates.all { it.isBefore(okDates.last()) })
+                    "pola: hanya tanggal terbaru yang terisi (kemungkinan batas riwayat broker akun Stockbit)"
+                    else "pola: tanggal kosong acak (kemungkinan pembatasan request Stockbit)"
+                return BrokerAnalysis(false, explanation = listOf(
+                    "Broker summary harian Stockbit hanya tersedia ${dailyWindows.size}/$requestedSessions sesi untuk $symbol",
+                    "Terisi: ${okDates.joinToString { it.toString().substring(5) }}",
+                    "Kosong: ${emptyDates.sortedDescending().joinToString { it.toString().substring(5) }}",
+                    pattern
+                ), failureKind = BrokerFailureKind.INCOMPLETE)
             }
             val sessionDates = dailyWindows.map { LocalDate.ofEpochDay(it.day.epochDay) }
             val (periods, foreignWindows) = coroutineScope {

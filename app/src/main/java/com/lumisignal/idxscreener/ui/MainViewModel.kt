@@ -196,7 +196,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                             result = series,
                             analyses = analyses,
                             warning = if (!broker.available || broker.score == null) {
-                                "Broker summary ${series.ticker.removeSuffix(".JK")} belum lengkap (${broker.failureKind?.label ?: "penyebab belum terklasifikasi"}): ${broker.explanation.joinToString().ifBlank { "respons kosong" }}. Skor teknikal tetap ditampilkan untuk diagnosis, tetapi tidak ada strategi yang dinyatakan lolos tanpa bukti broker."
+                                "Broker summary ${series.ticker.removeSuffix(".JK")} belum lengkap (${broker.failureKind?.label ?: "penyebab belum terklasifikasi"}): ${broker.explanation.joinToString("\n").ifBlank { "respons kosong" }}" +
+                                    (repo.stockbit.trafficStats().lastEmptySample?.let { "\n\nContoh respons kosong Stockbit: ${it.take(300)}" } ?: "") +
+                                    "\n\nSkor teknikal tetap ditampilkan untuk diagnosis, tetapi tidak ada strategi yang dinyatakan lolos tanpa bukti broker."
                             } else null
                         )
                     }
