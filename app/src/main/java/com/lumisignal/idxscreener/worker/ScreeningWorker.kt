@@ -118,9 +118,13 @@ class ScreeningWorker(context: Context, params: WorkerParameters) : CoroutineWor
             val names = universe.associate { it.ticker to it.companyName }
             var foreignByTicker: Map<String, List<Pair<java.time.LocalDate, Double>>> = emptyMap()
             var seriesSource = "STOCKBIT"
-            publish("Mengunduh ringkasan harian IDX (seluruh pasar)...", 0, 72)
-            when (val idx = withTimeoutOrNull(IDX_STAGE_TIMEOUT_MS) {
-                repo.idxDaily.buildSeries(names) { done: Int, target: Int -> throttledPublish("Ringkasan harian IDX $done/$target sesi", done, target) }
+            publish("Memuat ringkasan harian IDX (seluruh pasar)...", 0, 72)
+            // Fast path: IDX days already cached on the phone plus at most a few new sessions.
+            var idxSeeding: Job? = null
+            when (val idx = withTimeoutOrNull(IDX_QUICK_TIMEOUT_MS) {
+                repo.idxDaily.buildSeries(names, maxNetworkDays = IDX_QUICK_NETWORK_DAYS) { done: Int, target: Int ->
+                    throttledPublish("Ringkasan harian IDX $done/$target sesi", done, target)
+                }
             }) {
                 is DataResult.Success -> {
                     universe.forEach { item -> idx.value.series[item.ticker]?.let { seriesByTicker[item.ticker] = it } }
@@ -128,8 +132,21 @@ class ScreeningWorker(context: Context, params: WorkerParameters) : CoroutineWor
                     seriesSource = "IDX"
                     repo.log("Data harian IDX dipakai", "${seriesByTicker.size}/${universe.size} saham • ${idx.value.sessions.size} sesi • ${idx.value.networkRequests} request jaringan • via ${repo.idxDaily.lastTransport}")
                 }
-                is DataResult.Error -> repo.log("Data harian IDX tidak tersedia, beralih ke Stockbit", idx.userMessage, "WARN")
-                null -> repo.log("Data harian IDX timeout, beralih ke Stockbit", null, "WARN")
+                else -> {
+                    val reason = (idx as? DataResult.Error)?.userMessage ?: "timeout"
+                    repo.log("Data harian IDX belum siap, screening ini memakai Stockbit", "$reason • sinkron IDX dilanjutkan di latar belakang", "WARN")
+                    // Slow path: this run uses Stockbit, while the IDX history is downloaded
+                    // gently in parallel and cached, so later screenings take the fast path.
+                    idxSeeding = CoroutineScope(currentCoroutineContext() + SupervisorJob(currentCoroutineContext()[Job]) + Dispatchers.IO).launch {
+                        val seeded = withTimeoutOrNull(IDX_SEED_BUDGET_MS) { repo.idxDaily.buildSeries(names) }
+                        repo.log(
+                            if (seeded is DataResult.Success) "Sinkron IDX selesai — screening berikutnya memakai IDX" else "Sinkron IDX berlanjut di screening berikutnya",
+                            "${repo.idxDaily.lastCachedSessions}+ sesi tersimpan • via ${repo.idxDaily.lastTransport}" +
+                                ((seeded as? DataResult.Error)?.userMessage?.let { " • $it" } ?: ""),
+                            if (seeded is DataResult.Success) "INFO" else "WARN"
+                        )
+                    }
+                }
             }
             val missing = universe.filter { !seriesByTicker.containsKey(it.ticker) }
             // With IDX data only a handful of tickers (new listings, suspensions) still need
@@ -390,6 +407,7 @@ class ScreeningWorker(context: Context, params: WorkerParameters) : CoroutineWor
             if (traffic.emptyResponses > trafficBefore.emptyResponses) {
                 repo.log("Contoh respons broker kosong Stockbit", traffic.lastEmptySample ?: "-", "WARN")
             }
+            idxSeeding?.let { job -> withTimeoutOrNull(IDX_SEED_GRACE_MS) { job.join() } ?: job.cancelAndJoin() }
             return Result.success(stage(finalMessage, checked.get(), universe.size))
         } catch (e: CancellationException) {
             runDao.upsert(run.copy(status = "CANCELLED", completedAt = System.currentTimeMillis(), updatedAt = System.currentTimeMillis(), message = "Screening dibatalkan; cache checkpoint dipertahankan."))
@@ -433,7 +451,10 @@ class ScreeningWorker(context: Context, params: WorkerParameters) : CoroutineWor
         private const val STOCKBIT_CONCURRENCY = 8
         private const val BROKER_TICKER_CONCURRENCY = 3
         private const val PROGRESS_INTERVAL_MS = 1_200L
-        private const val IDX_STAGE_TIMEOUT_MS = 6 * 60_000L
+        private const val IDX_QUICK_TIMEOUT_MS = 2 * 60_000L
+        private const val IDX_QUICK_NETWORK_DAYS = 6
+        private const val IDX_SEED_BUDGET_MS = 12 * 60_000L
+        private const val IDX_SEED_GRACE_MS = 60_000L
         /** Broker verification never holds the run hostage: whatever is not verified in time is provisional. */
         private const val BROKER_TIME_BUDGET_MS = 8 * 60_000L
         private const val PROVISIONAL_MAX_UNAVAILABLE = 2

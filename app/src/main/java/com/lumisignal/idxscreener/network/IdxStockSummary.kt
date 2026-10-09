@@ -61,7 +61,11 @@ interface IdxBrowserFetcher {
 
 class IdxStockSummaryRepository(
     private val store: BrokerWindowStore? = null,
-    private val browserFactory: (() -> IdxBrowserFetcher)? = null
+    private val browserFactory: (() -> IdxBrowserFetcher)? = null,
+    /** Test seam: replaces direct HTTP. */
+    private val directOverride: (suspend (String) -> String)? = null,
+    private val spacingMs: Long = IDX_SPACING_MS,
+    private val backoffBaseMs: Long = 5_000L
 ) {
     private val jakarta = ZoneId.of("Asia/Jakarta")
     private val sessionMutex = Mutex()
@@ -74,31 +78,59 @@ class IdxStockSummaryRepository(
     @Volatile private var cookie: String? = null
     private val compact = DateTimeFormatter.BASIC_ISO_DATE
 
+    /**
+     * Builds 72-session series from cached IDX days plus at most [maxNetworkDays] downloads.
+     * Completed sessions never change, so every downloaded day is cached immediately: an
+     * interrupted or rate-limited sync resumes on the next screening instead of starting over.
+     * IDX rate-limits its API, so downloads are strictly sequential and paced.
+     */
     suspend fun buildSeries(
         names: Map<String, String>,
         sessions: Int = 72,
+        maxNetworkDays: Int = Int.MAX_VALUE,
         onProgress: suspend (done: Int, target: Int) -> Unit = { _, _ -> }
     ): DataResult<IdxBulkResult> = try {
         directBlocked = false
         browserFailure = null
-        lastTransport = "langsung"
+        lastTransport = "cache"
         val now = ZonedDateTime.now(jakarta)
         val newest = StockbitSessionPolicy.completedDataBucket(now)
         val weekdays = generateSequence(newest) { it.minusDays(1) }.filter { it.dayOfWeek.value <= 5 }
             .take(sessions + 45).toList()
         val days = sortedMapOf<LocalDate, Map<String, IdxDailyRow>>()
+        val uncached = mutableListOf<LocalDate>()
+        // Pass 1: cache only. Stop once cached sessions + unknown days could cover the target.
+        var walk = 0
+        while (walk < weekdays.size && days.size + uncached.size < sessions) {
+            val date = weekdays[walk++]
+            val cached = readCachedDay(date)
+            when {
+                cached == null -> uncached += date
+                cached.isNotEmpty() -> days[date] = cached
+            }
+        }
+        lastCachedSessions = days.size
+        if (uncached.size > maxNetworkDays) {
+            throw IOException("cache IDX ${days.size}/$sessions sesi; ${uncached.size} hari belum diunduh")
+        }
         var requests = 0
-        var cursor = 0
-        while (days.size < sessions && cursor < weekdays.size) {
-            val batch = weekdays.subList(cursor, minOf(weekdays.size, cursor + PARALLEL_DAYS))
-            cursor += batch.size
-            val results = coroutineScope {
-                batch.map { date -> async { date to loadDay(date, newest) } }.awaitAll()
+        val queue = ArrayDeque(uncached)
+        // Pass 2: download missing days newest first; holidays extend the walk further back.
+        while (days.size < sessions) {
+            val date: LocalDate = if (queue.isNotEmpty()) queue.removeFirst() else {
+                val more = weekdays.getOrNull(walk++) ?: break
+                val cached = readCachedDay(more)
+                if (cached != null) {
+                    if (cached.isNotEmpty()) days[more] = cached
+                    continue
+                }
+                more
             }
-            results.forEach { (date, loaded) ->
-                if (loaded.fromNetwork) requests++
-                if (loaded.rows.isNotEmpty()) days[date] = loaded.rows
-            }
+            if (requests.toLong() >= maxNetworkDays.toLong() + 10L) break
+            if (requests > 0) delay(spacingMs)
+            val rows = downloadDay(date, newest)
+            requests++
+            if (rows.isNotEmpty()) days[date] = rows
             onProgress(days.size.coerceAtMost(sessions), sessions)
         }
         if (days.size < 60) throw IOException("IDX hanya memberi ${days.size} sesi")
@@ -135,41 +167,51 @@ class IdxStockSummaryRepository(
     } catch (e: Throwable) {
         DataResult.Error("Ringkasan harian IDX tidak tersedia ($lastTransport): ${e.message ?: e.javaClass.simpleName}", e)
     } finally {
-        browserMutex.withLock {
-            browser?.let { runCatching { it.close() } }
-            browser = null
+        // Must run even when the caller was cancelled, or the hidden WebView would leak.
+        withContext(kotlinx.coroutines.NonCancellable) {
+            browserMutex.withLock {
+                browser?.let { runCatching { it.close() } }
+                browser = null
+            }
         }
     }
 
-    private data class LoadedDay(val rows: Map<String, IdxDailyRow>, val fromNetwork: Boolean)
+    /** Sessions already stored on the phone during previous runs (for the progress message). */
+    @Volatile var lastCachedSessions: Int = 0
+        private set
 
-    private suspend fun loadDay(date: LocalDate, newest: LocalDate): LoadedDay {
-        val key = "IDXDAY_V1:$date"
-        store?.let { s ->
-            runCatching { s.read(key) }.getOrNull()?.let { payload ->
-                runCatching { decodeDay(JSONObject(payload)) }.getOrNull()?.let { return LoadedDay(it, false) }
-            }
-        }
-        var rows: Map<String, IdxDailyRow>? = null
+    private suspend fun readCachedDay(date: LocalDate): Map<String, IdxDailyRow>? {
+        val payload = store?.let { s -> runCatching { s.read("IDXDAY_V1:$date") }.getOrNull() } ?: return null
+        return runCatching { decodeDay(JSONObject(payload)) }.getOrNull()
+    }
+
+    private suspend fun downloadDay(date: LocalDate, newest: LocalDate): Map<String, IdxDailyRow> {
         var lastError: Throwable? = null
         val url = "https://www.idx.co.id/primary/TradingSummary/GetStockSummary?length=9999&start=0&date=${date.format(compact)}"
-        for (attempt in 0 until 3) {
+        var throttled = 0
+        var failures = 0
+        while (true) {
             try {
-                rows = parseDay(fetch(url))
-                break
+                val result = parseDay(fetch(url))
+                // A recent empty day may simply not be published yet; only old empty days are holidays.
+                val cacheable = result.isNotEmpty() || date.isBefore(newest.minusDays(4))
+                if (cacheable) runCatching { store?.write("IDXDAY_V1:$date", "IDX", encodeDay(result).toString(), DAY_TTL_MS) }
+                return result
             } catch (e: CancellationException) {
                 throw e
+            } catch (e: RateLimitException) {
+                lastError = e
+                if (++throttled > 5) break
+                // IDX/Cloudflare rate limit: back off generously (5 s, 10 s, 20 s, 40 s, 60 s).
+                delay(maxOf(e.retryAfterMs, (backoffBaseMs shl (throttled - 1)).coerceAtMost(60_000L)))
             } catch (e: Throwable) {
                 lastError = e
                 if (e is HttpStatusException && (e.status == 401 || e.status == 403)) cookie = null
-                delay(800L shl attempt)
+                if (++failures >= 3) break
+                delay((backoffBaseMs / 3) shl failures)
             }
         }
-        val result = rows ?: throw IOException("IDX $date gagal: ${lastError?.message ?: "tanpa respons"}", lastError)
-        // A recent empty day may simply not be published yet; only old empty days are holidays.
-        val cacheable = result.isNotEmpty() || date.isBefore(newest.minusDays(4))
-        if (cacheable) runCatching { store?.write(key, "IDX", encodeDay(result).toString(), DAY_TTL_MS) }
-        return LoadedDay(result, true)
+        throw IOException("IDX $date gagal: ${lastError?.message ?: "tanpa respons"}", lastError)
     }
 
     private suspend fun ensureCookie(): String? = sessionMutex.withLock {
@@ -201,7 +243,7 @@ class IdxStockSummaryRepository(
     private suspend fun fetch(url: String): String {
         if (!directBlocked) {
             try {
-                return request(url)
+                return (directOverride?.invoke(url) ?: request(url)).also { lastTransport = "langsung" }
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Throwable) {
@@ -254,7 +296,7 @@ class IdxStockSummaryRepository(
     )
 
     companion object {
-        private const val PARALLEL_DAYS = 3
+        private const val IDX_SPACING_MS = 1_200L
         private const val DAY_TTL_MS = 150L * 24 * 60 * 60_000
 
         internal fun parseDay(payload: String): Map<String, IdxDailyRow> {

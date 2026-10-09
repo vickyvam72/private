@@ -28,12 +28,14 @@ class IdxWebTransport(context: Context) : IdxBrowserFetcher {
     private var webView: WebView? = null
     private val pending = ConcurrentHashMap<String, CompletableDeferred<Pair<Int, String>>>()
     private val counter = AtomicInteger(0)
+    private val retryAfterById = ConcurrentHashMap<String, String>()
     @Volatile override var lastTitle: String = ""
         private set
 
     private inner class Bridge {
         @JavascriptInterface
-        fun onResult(id: String, status: Int, body: String) {
+        fun onResult(id: String, status: Int, retryAfter: String, body: String) {
+            retryAfterById[id] = retryAfter
             pending.remove(id)?.complete(status to body)
         }
     }
@@ -80,8 +82,8 @@ class IdxWebTransport(context: Context) : IdxBrowserFetcher {
         val script = """
             (function(){
               fetch('$url',{credentials:'include',headers:{'Accept':'application/json, text/plain, */*','X-Requested-With':'XMLHttpRequest'}})
-                .then(function(r){return r.text().then(function(t){LumiBridge.onResult('$id',r.status,t);});})
-                .catch(function(e){LumiBridge.onResult('$id',-1,String(e));});
+                .then(function(r){return r.text().then(function(t){LumiBridge.onResult('$id',r.status,r.headers.get('retry-after')||'',t);});})
+                .catch(function(e){LumiBridge.onResult('$id',-1,'',String(e));});
             })();
         """.trimIndent()
         withContext(Dispatchers.Main) {
@@ -89,7 +91,8 @@ class IdxWebTransport(context: Context) : IdxBrowserFetcher {
         }
         val (status, body) = withTimeoutOrNull(FETCH_TIMEOUT_MS) { result.await() }
             ?: run { pending.remove(id); throw IOException("IDX WebView timeout") }
-        if (status == 429) throw RateLimitException()
+        val retryAfterMs = retryAfterById.remove(id)?.trim()?.toLongOrNull()?.times(1_000L) ?: 0L
+        if (status == 429) throw RateLimitException(retryAfterMs)
         if (status < 0) throw IOException("IDX WebView: $body")
         if (status !in 200..299) throw HttpStatusException(status, body.take(200))
         if (HttpClient.looksLikeHtmlChallenge(body)) throw RateLimitException(challenge = true)

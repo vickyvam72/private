@@ -26,3 +26,16 @@ and retrying only made the run slower. 1.13.0 stops depending on hundreds of tho
   `GetStockSummary` from inside the page with `fetch`, returning the JSON through a
   `@JavascriptInterface` bridge (kept by R8). If the page itself stays blocked, the run falls back to
   Stockbit OHLCVF as before. The activity log names the transport used.
+
+## 1.13.2
+
+- Field run: the hidden WebView opened IDX's page successfully, but `GetStockSummary` answered
+  HTTP 429 because three days were requested at once and only retried briefly.
+- IDX downloads are now strictly sequential (1.2 s apart) and back off 5/10/20/40/60 s on 429,
+  honouring `Retry-After` (passed through the JavaScript bridge).
+- Every downloaded session is cached immediately, so the history sync is resumable.
+- Fast path: a screening uses IDX only when the cache already holds the history (≤6 new sessions
+  to download). Otherwise that screening uses Stockbit OHLCVF while the IDX history is synced in the
+  background in parallel (12-minute budget); later screenings then take the fast path.
+- Fixed: `maxNetworkDays + 10` overflowed for `Int.MAX_VALUE`, aborting a full sync immediately
+  (caught by the new `IdxSyncResumeTest`).
