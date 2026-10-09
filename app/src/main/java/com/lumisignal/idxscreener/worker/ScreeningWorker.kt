@@ -162,6 +162,9 @@ class ScreeningWorker(context: Context, params: WorkerParameters) : CoroutineWor
                         repeat(minOf(YAHOO_CONCURRENCY, universe.size)) {
                             launch(Dispatchers.IO) {
                                 while (true) {
+                                    // Circuit breaker: if Yahoo rejects this network (429/blocked), stop quickly.
+                                    val done = yahooDone.get()
+                                    if (done >= 24 && yahooSeries.size * 4 < done) break
                                     val item = universe.getOrNull(nextYahoo.getAndIncrement()) ?: break
                                     try {
                                         val data = withTimeoutOrNull(YAHOO_TICKER_TIMEOUT_MS) { repo.yahoo.fetch(item.ticker, item.companyName) }

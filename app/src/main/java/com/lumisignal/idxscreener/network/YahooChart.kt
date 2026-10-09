@@ -24,7 +24,7 @@ class YahooChartRepository(private val http: HttpClient = HttpClient()) {
         var last: Throwable? = null
         for (host in HOSTS) {
             try {
-                val body = http.get("https://$host/v8/finance/chart/$symbol.JK?range=6mo&interval=1d&includePrePost=false&events=div%2Csplit", HEADERS, 2)
+                val body = http.get("https://$host/v8/finance/chart/$symbol.JK?range=6mo&interval=1d&includePrePost=false&events=div%2Csplit", HEADERS, 1)
                 val candles = parse(body, ZonedDateTime.now(jakarta))
                 if (candles.size < 60) return DataResult.Error("Yahoo $symbol hanya ${candles.size} sesi")
                 return DataResult.Success(MarketSeries("$symbol.JK", companyName.ifBlank { symbol }, "IDR", candles))

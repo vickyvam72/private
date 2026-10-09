@@ -12,3 +12,8 @@
 - Free GitHub datasets were evaluated; the actively updated ones also scrape idx.co.id and hit the
   same Cloudflare challenge, so none was adopted.
 - CI publishes `yahoo-probe.txt` with each build.
+
+## 1.14.1
+
+- CI probe: Yahoo answers 429 to GitHub data-centre IPs. Added a circuit breaker (after 24 tickers,
+  <25% success stops the Yahoo stage) and single attempts, so a blocked network costs seconds.
