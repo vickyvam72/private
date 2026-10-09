@@ -85,7 +85,8 @@ class AppRepository(context: Context) {
         ticker: String,
         referenceEpochSeconds: Long,
         dailySessions: Int = 20,
-        knownSessionEpochSeconds: List<Long> = emptyList()
+        knownSessionEpochSeconds: List<Long> = emptyList(),
+        includeForeign: Boolean = true
     ): BrokerAnalysis {
         val requestedSessions = dailySessions.coerceIn(10, 20)
         val referenceDate = Instant.ofEpochSecond(referenceEpochSeconds).atZone(JAKARTA).toLocalDate()
@@ -93,7 +94,7 @@ class AppRepository(context: Context) {
         db.cacheDao().broker(key, System.currentTimeMillis())?.let { cached ->
             runCatching { CandidateJson.decodeBrokerAnalysis(JSONObject(cached.payload)) }.getOrNull()?.let { return it }
         }
-        val analysis = stockbit.brokerAnalysis(ticker, referenceEpochSeconds, requestedSessions, knownSessionEpochSeconds)
+        val analysis = stockbit.brokerAnalysis(ticker, referenceEpochSeconds, requestedSessions, knownSessionEpochSeconds, includeForeign)
         storeBrokerAnalysis(key, ticker, "EVENT_FLOW_DAILY_${requestedSessions}D_TOP3_PERSISTENCE_10D", analysis)
         return analysis
     }

@@ -290,7 +290,9 @@ class ScreeningWorker(context: Context, params: WorkerParameters) : CoroutineWor
                             when {
                                 expectedDailySessions > 0 -> repo.brokerAnalysis(
                                     ticker, series.candles.last().epochSeconds, expectedDailySessions,
-                                    series.candles.map { it.epochSeconds }
+                                    series.candles.map { it.epochSeconds },
+                                    // Foreign flow comes free from IDX; skip 2 broker reads per ticker.
+                                    includeForeign = foreignByTicker.isEmpty()
                                 )
                                 needsLatestBroker -> repo.brokerPeriodAnalysis(
                                     ticker, series.candles.last().epochSeconds, setOf(1, 10),
@@ -488,12 +490,12 @@ class ScreeningWorker(context: Context, params: WorkerParameters) : CoroutineWor
         private const val MARKET_STAGE_TIMEOUT_MS = 45 * 60_000L
         // Per-ticker limits are generous on purpose: queueing behind the adaptive request lanes
         // is not a failure. Real network failures surface through the per-request retry policy.
-        private const val BROKER_SEED_TICKER_TIMEOUT_MS = 90_000L
-        private const val BROKER_TICKER_TIMEOUT_MS = 3 * 60_000L
+        private const val BROKER_SEED_TICKER_TIMEOUT_MS = 2 * 60_000L
+        private const val BROKER_TICKER_TIMEOUT_MS = 5 * 60_000L
         private const val MARKET_CONTEXT_TIMEOUT_MS = 60_000L
         private const val STOCKBIT_CONNECTION_TIMEOUT_MS = 25_000L
         private const val STOCKBIT_CONCURRENCY = 8
-        private const val BROKER_TICKER_CONCURRENCY = 3
+        private const val BROKER_TICKER_CONCURRENCY = 2
         private const val PROGRESS_INTERVAL_MS = 1_200L
         private const val IDX_QUICK_TIMEOUT_MS = 2 * 60_000L
         private const val YAHOO_STAGE_TIMEOUT_MS = 4 * 60_000L
@@ -503,7 +505,7 @@ class ScreeningWorker(context: Context, params: WorkerParameters) : CoroutineWor
         private const val IDX_SEED_BUDGET_MS = 12 * 60_000L
         private const val IDX_SEED_GRACE_MS = 60_000L
         /** Broker verification never holds the run hostage: whatever is not verified in time is provisional. */
-        private const val BROKER_TIME_BUDGET_MS = 8 * 60_000L
+        private const val BROKER_TIME_BUDGET_MS = 10 * 60_000L
         private const val PROVISIONAL_MAX_UNAVAILABLE = 2
         /** Stockbit appears to cap broker-summary reads per account; spend them on the best setups only. */
         private const val BROKER_REQUEST_BUDGET = 400

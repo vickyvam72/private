@@ -434,7 +434,8 @@ class StockbitRepository(
     private val refreshMutex = Mutex()
     private val urgentWaiters = AtomicInteger(0)
     private val generalGate = AdaptiveRateGate(maxConcurrent = 4, minSpacingMs = 140L, initialSpacingMs = 175L, maxSpacingMs = 5_000L)
-    private val brokerGate = AdaptiveRateGate(maxConcurrent = 2, minSpacingMs = 350L, initialSpacingMs = 600L, maxSpacingMs = 5_000L)
+    // Field data: >2 broker reads within ~1 s are silently throttled. One at a time, paced, adaptive.
+    private val brokerGate = AdaptiveRateGate(maxConcurrent = 1, minSpacingMs = 900L, initialSpacingMs = 1_500L, maxSpacingMs = 15_000L)
     private val windowMemo = object : LinkedHashMap<String, MemoWindow>(1024, 0.75f, true) {
         override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, MemoWindow>?): Boolean = size > 8_000
     }
@@ -923,7 +924,8 @@ class StockbitRepository(
         ticker: String,
         referenceEpochSeconds: Long,
         dailySessions: Int = 20,
-        knownSessionEpochSeconds: List<Long> = emptyList()
+        knownSessionEpochSeconds: List<Long> = emptyList(),
+        includeForeign: Boolean = true
     ): BrokerAnalysis {
         if (!hasSession()) return BrokerAnalysis(false, explanation = listOf("Broker Analysis Unavailable — Stockbit belum terhubung"), failureKind = BrokerFailureKind.AUTH)
         val symbol = ticker.removeSuffix(".JK").uppercase()
@@ -972,6 +974,7 @@ class StockbitRepository(
                 val all = async { fetchPeriods(symbol, sessionDates, listOf(1, 3, 5, 10), "ALL") }
                 // Foreign flow is descriptive only (no strategy gate uses it), so it never fails the ticker.
                 val foreign = async {
+                    if (!includeForeign) return@async emptyMap<Int, BrokerWindow>()
                     runCatching { fetchPeriods(symbol, sessionDates, listOf(1, 10), "FOREIGN") }
                         .getOrElse { if (it is CancellationException) throw it else emptyMap() }
                 }
@@ -1200,25 +1203,42 @@ class StockbitRepository(
      * silently. Every date Lumi asks for is a session with traded volume, so an empty answer
      * is treated like a soft rate limit: the broker lane slows down and the window is retried.
      */
+    /**
+     * Stockbit's silent throttle has a precise signature (field-confirmed): HTTP 200,
+     * "Successfully retrieved market detector data", empty broker lists AND empty `from`/`to`
+     * echo — the requested dates were never applied. A genuine empty session echoes the dates.
+     * Throttled answers pause the whole broker lane and the same window is asked again; only a
+     * date-echoing empty answer is accepted as "no broker activity".
+     */
     private suspend fun requestNonEmptyBrokerWindow(symbol: String, from: LocalDate, to: LocalDate, investorType: String): BrokerWindow? {
-        repeat(EMPTY_RETRY_DELAYS_MS.size + 1) { attempt ->
+        var throttled = 0
+        while (true) {
             val (window, raw) = requestBrokerWindow(symbol, from, to, investorType)
             if (window != null) {
-                if (attempt > 0) emptyRecovered.incrementAndGet()
+                if (throttled > 0) emptyRecovered.incrementAndGet()
                 recordBrokerOutcome(true)
                 recordTimeline("ok")
                 if (lastOkSample == null) lastOkSample = "$symbol $from..$to: ${describeBrokerPayload(raw)}"
                 return window
             }
+            val echoed = brokerEchoesDates(raw)
             emptyResponses.incrementAndGet()
-            recordBrokerOutcome(false)
-            recordTimeline("E")
             lastEmptySample = "$symbol $from..$to $investorType: ${describeBrokerPayload(raw)}"
-            if (investorType != "ALL") return null // FOREIGN can be legitimately empty
-            brokerGate.onSoftThrottle()
-            EMPTY_RETRY_DELAYS_MS.getOrNull(attempt)?.let { delay(it + kotlin.random.Random.nextLong(0L, 800L)) }
+            if (echoed) {
+                // Dates were applied and the session really has no rows for this filter.
+                recordBrokerOutcome(true)
+                recordTimeline("0")
+                return null
+            }
+            recordTimeline("T")
+            brokerGate.onRateLimited(THROTTLE_PAUSE_MS, challenge = false)
+            if (++throttled > THROTTLE_RETRIES) {
+                // Only a window that stays throttled after the lane slowed down counts against
+                // the circuit breaker; transient throttles are part of finding the safe pace.
+                recordBrokerOutcome(false)
+                throw RateLimitException()
+            }
         }
-        return null
     }
 
     private suspend fun requestBrokerWindow(symbol: String, from: LocalDate, to: LocalDate, investorType: String): Pair<BrokerWindow?, String> {
@@ -1229,6 +1249,11 @@ class StockbitRepository(
         )
         return parseBrokerWindow(raw, to, investorType) to raw
     }
+
+    private fun brokerEchoesDates(raw: String): Boolean = runCatching {
+        val data = JSONObject(raw).optJSONObject("data") ?: return false
+        data.optString("from").isNotBlank() && data.optString("to").isNotBlank()
+    }.getOrDefault(false)
 
     private fun parseBrokerWindow(raw: String, to: LocalDate, investorType: String): BrokerWindow? {
         val body = JSONObject(raw)
@@ -1488,7 +1513,8 @@ class StockbitRepository(
         private const val DAILY_RESERVE_SESSIONS = 6
         private const val LIVE_WINDOW_TTL_MS = 2 * 60_000L
         private const val EMPTY_WINDOW_TTL_MS = 60_000L
-        private val EMPTY_RETRY_DELAYS_MS = listOf(1_500L)
+        private const val THROTTLE_RETRIES = 4
+        private const val THROTTLE_PAUSE_MS = 4_000L
         private const val BROKER_HEALTH_WINDOW = 20
         private const val BROKER_HEALTH_MIN_SAMPLES = 12
         private const val BROKER_HEALTH_BAD_RATIO = 0.6
