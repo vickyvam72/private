@@ -326,6 +326,8 @@ class ScreeningWorker(context: Context, params: WorkerParameters) : CoroutineWor
                 if (stopReason.get() != null) return true
                 val reason = when {
                     repo.stockbit.brokerDegraded() -> "Stockbit membatasi broker summary (respons kosong/429 beruntun)"
+                    repo.stockbit.trafficStats().brokerCompleted - trafficBefore.brokerCompleted >= BROKER_REQUEST_BUDGET ->
+                        "batas $BROKER_REQUEST_BUDGET request broker per screening tercapai (hemat kuota Stockbit)"
                     System.currentTimeMillis() - brokerStageStart > BROKER_TIME_BUDGET_MS -> "batas waktu verifikasi broker ${BROKER_TIME_BUDGET_MS / 60_000} menit tercapai"
                     else -> null
                 }
@@ -446,6 +448,8 @@ class ScreeningWorker(context: Context, params: WorkerParameters) : CoroutineWor
             )
             if (traffic.emptyResponses > trafficBefore.emptyResponses) {
                 repo.log("Contoh respons broker kosong Stockbit", traffic.lastEmptySample ?: "-", "WARN")
+                traffic.lastOkSample?.let { repo.log("Contoh respons broker berisi Stockbit", it) }
+                repo.log("Timeline broker (detik:hasil)", traffic.brokerTimeline.ifBlank { "-" }, "WARN")
             }
             idxSeeding?.let { job -> withTimeoutOrNull(IDX_SEED_GRACE_MS) { job.join() } ?: job.cancelAndJoin() }
             return Result.success(stage(finalMessage, checked.get(), universe.size))
@@ -501,6 +505,8 @@ class ScreeningWorker(context: Context, params: WorkerParameters) : CoroutineWor
         /** Broker verification never holds the run hostage: whatever is not verified in time is provisional. */
         private const val BROKER_TIME_BUDGET_MS = 8 * 60_000L
         private const val PROVISIONAL_MAX_UNAVAILABLE = 2
+        /** Stockbit appears to cap broker-summary reads per account; spend them on the best setups only. */
+        private const val BROKER_REQUEST_BUDGET = 400
 
         private fun compactIdr(value: Double): String {
             val abs = kotlin.math.abs(value)

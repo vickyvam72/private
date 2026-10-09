@@ -17,3 +17,12 @@
 
 - CI probe: Yahoo answers 429 to GitHub data-centre IPs. Added a circuit breaker (after 24 tickers,
   <25% success stops the Yahoo stage) and single attempts, so a blocked network costs seconds.
+
+## 1.14.2
+
+- Field run: IDX via WebView works (72 sessions cached, OHLCVF 844/844 from IDX in seconds).
+- Broker: Stockbit answers "Successfully retrieved market detector data" with empty broker lists for
+  almost every request from the start of a run, while the Stockbit app still shows the same dates.
+  Likely a per-account read cap on the API. Added: structural summary of empty vs filled answers
+  (array sizes, echoed dates, bandar_detector), a seconds:outcome timeline of broker answers, both in
+  the activity log and in manual analysis; and a hard budget of 400 broker requests per screening.

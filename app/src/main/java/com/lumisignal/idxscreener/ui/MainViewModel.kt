@@ -183,6 +183,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 is DataResult.Success -> {
                     val series = result.value
                     _search.value = SearchUi(loading = true, result = series)
+                    repo.stockbit.resetBrokerHealth()
                     val broker = kotlinx.coroutines.withTimeoutOrNull(240_000) {
                         repo.brokerAnalysis(series.ticker, series.candles.last().epochSeconds, 20, series.candles.map { it.epochSeconds })
                     }
@@ -197,7 +198,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                             analyses = analyses,
                             warning = if (!broker.available || broker.score == null) {
                                 "Broker summary ${series.ticker.removeSuffix(".JK")} belum lengkap (${broker.failureKind?.label ?: "penyebab belum terklasifikasi"}): ${broker.explanation.joinToString("\n").ifBlank { "respons kosong" }}" +
-                                    (repo.stockbit.trafficStats().lastEmptySample?.let { "\n\nContoh respons kosong Stockbit: ${it.take(300)}" } ?: "") +
+                                    repo.stockbit.trafficStats().let { t ->
+                                        (t.lastEmptySample?.let { "\n\nRespons kosong: $it" } ?: "") +
+                                        (t.lastOkSample?.let { "\nRespons berisi: $it" } ?: "") +
+                                        t.brokerTimeline.takeIf { it.isNotBlank() }?.let { "\nTimeline: $it" }.orEmpty()
+                                    } +
                                     "\n\nSkor teknikal tetap ditampilkan untuk diagnosis, tetapi tidak ada strategi yang dinyatakan lolos tanpa bukti broker."
                             } else null
                         )

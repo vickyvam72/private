@@ -420,7 +420,9 @@ data class StockbitTrafficStats(
     val generalSpacingMs: Long,
     val emptyResponses: Int = 0,
     val emptyRecovered: Int = 0,
-    val lastEmptySample: String? = null
+    val lastEmptySample: String? = null,
+    val lastOkSample: String? = null,
+    val brokerTimeline: String = ""
 )
 
 /** Experimental read-only connector for Stockbit's private web API. */
@@ -456,7 +458,9 @@ class StockbitRepository(
         generalSpacingMs = generalGate.currentSpacingMs(),
         emptyResponses = emptyResponses.get(),
         emptyRecovered = emptyRecovered.get(),
-        lastEmptySample = lastEmptySample
+        lastEmptySample = lastEmptySample,
+        lastOkSample = lastOkSample,
+        brokerTimeline = brokerTimeline()
     )
 
     fun storeCapturedSession(session: CapturedStockbitSession): DataResult<Unit> {
@@ -1149,6 +1153,19 @@ class StockbitRepository(
 
     private val brokerOutcomes = ArrayDeque<Boolean>()
 
+    private val brokerTimeline = StringBuilder()
+    @Volatile private var brokerTimelineStart = 0L
+    @Volatile private var lastOkSample: String? = null
+
+    /** Compact "seconds:outcome" trail of the first broker answers, to tell quota from throttling. */
+    fun brokerTimeline(): String = synchronized(brokerTimeline) { brokerTimeline.toString().trim() }
+
+    private fun recordTimeline(mark: String) = synchronized(brokerTimeline) {
+        val now = System.currentTimeMillis()
+        if (brokerTimelineStart == 0L) brokerTimelineStart = now
+        if (brokerTimeline.length < 420) brokerTimeline.append((now - brokerTimelineStart) / 1000).append(':').append(mark).append(' ')
+    }
+
     private fun recordBrokerOutcome(ok: Boolean) = synchronized(brokerOutcomes) {
         brokerOutcomes.addLast(ok)
         while (brokerOutcomes.size > BROKER_HEALTH_WINDOW) brokerOutcomes.removeFirst()
@@ -1164,7 +1181,10 @@ class StockbitRepository(
             brokerOutcomes.count { !it } >= brokerOutcomes.size * BROKER_HEALTH_BAD_RATIO
     }
 
-    fun resetBrokerHealth() = synchronized(brokerOutcomes) { brokerOutcomes.clear() }
+    fun resetBrokerHealth() {
+        synchronized(brokerOutcomes) { brokerOutcomes.clear() }
+        synchronized(brokerTimeline) { brokerTimeline.setLength(0); brokerTimelineStart = 0L }
+    }
 
     private val emptyResponses = AtomicInteger(0)
     private val emptyRecovered = AtomicInteger(0)
@@ -1186,11 +1206,14 @@ class StockbitRepository(
             if (window != null) {
                 if (attempt > 0) emptyRecovered.incrementAndGet()
                 recordBrokerOutcome(true)
+                recordTimeline("ok")
+                if (lastOkSample == null) lastOkSample = "$symbol $from..$to: ${describeBrokerPayload(raw)}"
                 return window
             }
             emptyResponses.incrementAndGet()
             recordBrokerOutcome(false)
-            lastEmptySample = "$symbol $from..$to $investorType: ${raw.take(EMPTY_SAMPLE_CHARS)}"
+            recordTimeline("E")
+            lastEmptySample = "$symbol $from..$to $investorType: ${describeBrokerPayload(raw)}"
             if (investorType != "ALL") return null // FOREIGN can be legitimately empty
             brokerGate.onSoftThrottle()
             EMPTY_RETRY_DELAYS_MS.getOrNull(attempt)?.let { delay(it + kotlin.random.Random.nextLong(0L, 800L)) }
@@ -1349,7 +1372,7 @@ class StockbitRepository(
                 throw e
             } catch (e: RateLimitException) {
                 gate.onRateLimited(e.retryAfterMs, e.challenge)
-                if (priority == StockbitRequestPriority.BROKER_HISTORY) recordBrokerOutcome(false)
+                if (priority == StockbitRequestPriority.BROKER_HISTORY) { recordBrokerOutcome(false); recordTimeline(if (e.challenge) "CF" else "429") }
                 throttled++
                 if (throttled >= 3 && System.currentTimeMillis() - startedAt > throttleBudgetMs) throw e
                 if (throttled >= 40) throw e
@@ -1481,6 +1504,22 @@ class StockbitRepository(
         const val SECURITIES_ACCESS_EXPIRY_KEY = "stockbit_securities_access_expiry"
 
         private fun normalizeKey(value: String) = value.lowercase().replace(Regex("[^a-z0-9]"), "")
+
+        /** Structure of a broker-summary answer in one short line (no token, no broker values). */
+        internal fun describeBrokerPayload(raw: String): String = runCatching {
+            val root = JSONObject(raw)
+            val data = root.optJSONObject("data")
+            val summary = data?.optJSONObject("broker_summary")
+            val bandar = data?.optJSONObject("bandar_detector")
+            buildString {
+                append("msg=").append(root.optString("message").take(60))
+                append("; data=").append(data?.keys()?.asSequence()?.joinToString(",") ?: "null")
+                append("; buy=").append(summary?.optJSONArray("brokers_buy")?.length() ?: -1)
+                append("; sell=").append(summary?.optJSONArray("brokers_sell")?.length() ?: -1)
+                append("; echo=").append(data?.optString("from")).append("..").append(data?.optString("to"))
+                if (bandar != null) append("; bandar.value=").append(bandar.opt("value")).append(" buyers=").append(bandar.opt("total_buyer"))
+            }
+        }.getOrElse { "tidak bisa dibaca: ${raw.take(160)}" }
 
         private fun allObjects(root: Any?): List<JSONObject> {
             val out = mutableListOf<JSONObject>()
