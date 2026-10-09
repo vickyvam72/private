@@ -104,6 +104,19 @@ internal class AdaptiveRateGate(
         }
     }
 
+    private var lastSoftAt = 0L
+
+    /** Milder signal for silent throttling (HTTP 200 with an empty payload): no lane pause. */
+    fun onSoftThrottle() {
+        synchronized(this) {
+            val now = System.currentTimeMillis()
+            if (now - lastSoftAt > 5_000L) {
+                spacingMs = (spacingMs * 1.25).coerceAtMost(maxSpacingMs.toDouble())
+                lastSoftAt = now
+            }
+        }
+    }
+
     fun currentSpacingMs(): Long = synchronized(this) { spacingMs.toLong() }
 }
 
@@ -404,7 +417,10 @@ data class StockbitTrafficStats(
     val rateLimitHits: Int,
     val challengeHits: Int,
     val brokerSpacingMs: Long,
-    val generalSpacingMs: Long
+    val generalSpacingMs: Long,
+    val emptyResponses: Int = 0,
+    val emptyRecovered: Int = 0,
+    val lastEmptySample: String? = null
 )
 
 /** Experimental read-only connector for Stockbit's private web API. */
@@ -416,7 +432,7 @@ class StockbitRepository(
     private val refreshMutex = Mutex()
     private val urgentWaiters = AtomicInteger(0)
     private val generalGate = AdaptiveRateGate(maxConcurrent = 4, minSpacingMs = 140L, initialSpacingMs = 175L, maxSpacingMs = 5_000L)
-    private val brokerGate = AdaptiveRateGate(maxConcurrent = 3, minSpacingMs = 300L, initialSpacingMs = 550L, maxSpacingMs = 5_000L)
+    private val brokerGate = AdaptiveRateGate(maxConcurrent = 2, minSpacingMs = 350L, initialSpacingMs = 600L, maxSpacingMs = 5_000L)
     private val windowMemo = object : LinkedHashMap<String, MemoWindow>(1024, 0.75f, true) {
         override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, MemoWindow>?): Boolean = size > 8_000
     }
@@ -437,7 +453,10 @@ class StockbitRepository(
         rateLimitHits = generalGate.rateLimitHits.get() + brokerGate.rateLimitHits.get(),
         challengeHits = generalGate.challengeHits.get() + brokerGate.challengeHits.get(),
         brokerSpacingMs = brokerGate.currentSpacingMs(),
-        generalSpacingMs = generalGate.currentSpacingMs()
+        generalSpacingMs = generalGate.currentSpacingMs(),
+        emptyResponses = emptyResponses.get(),
+        emptyRecovered = emptyRecovered.get(),
+        lastEmptySample = lastEmptySample
     )
 
     fun storeCapturedSession(session: CapturedStockbitSession): DataResult<Unit> {
@@ -1060,7 +1079,7 @@ class StockbitRepository(
      * persisted, so repeat screenings fetch only what is new.
      */
     private suspend fun fetchBrokerWindow(symbol: String, from: LocalDate, to: LocalDate, investorType: String): BrokerWindow? {
-        val key = "BW2:$symbol:$from:$to:$investorType"
+        val key = "BW3:$symbol:$from:$to:$investorType"
         val now = System.currentTimeMillis()
         synchronized(windowMemo) { windowMemo[key] }?.let { memo ->
             if (memo.expiresAt > now) return memo.window
@@ -1096,38 +1115,69 @@ class StockbitRepository(
             windowStore?.let { store ->
                 runCatching { store.read(key) }.getOrNull()?.let { payload ->
                     val decoded = runCatching { decodeWindow(JSONObject(payload)) }
-                    if (decoded.isSuccess) {
-                        val window = decoded.getOrNull()
-                        remember(key, window, if (window == null) EMPTY_WINDOW_TTL_MS else SETTLED_WINDOW_TTL_MS)
+                    val window = decoded.getOrNull()
+                    if (window != null) {
+                        remember(key, window, SETTLED_WINDOW_TTL_MS)
                         return window
                     }
                 }
             }
         }
-        val window = requestBrokerWindow(symbol, from, to, investorType)
-        val ttl = when {
-            !settled -> LIVE_WINDOW_TTL_MS
-            window == null -> EMPTY_WINDOW_TTL_MS
-            else -> SETTLED_WINDOW_TTL_MS
+        val window = requestNonEmptyBrokerWindow(symbol, from, to, investorType)
+        if (window == null) {
+            // Never persist an empty answer: on Stockbit it is usually a silent throttle,
+            // not a genuinely empty session (every date requested is proven by OHLCVF volume).
+            remember(key, null, EMPTY_WINDOW_TTL_MS)
+            return null
         }
-        remember(key, window, ttl)
+        remember(key, window, if (settled) SETTLED_WINDOW_TTL_MS else LIVE_WINDOW_TTL_MS)
         if (settled) {
-            runCatching { windowStore?.write(key, "$symbol.JK", encodeWindow(window).toString(), ttl) }
+            runCatching { windowStore?.write(key, "$symbol.JK", encodeWindow(window).toString(), SETTLED_WINDOW_TTL_MS) }
         }
         return window
     }
+
+    private val emptyResponses = AtomicInteger(0)
+    private val emptyRecovered = AtomicInteger(0)
+    @Volatile private var lastEmptySample: String? = null
 
     private fun remember(key: String, window: BrokerWindow?, ttlMs: Long) {
         val memoTtl = ttlMs.coerceAtMost(6 * 60 * 60_000L)
         synchronized(windowMemo) { windowMemo[key] = MemoWindow(window, System.currentTimeMillis() + memoTtl) }
     }
 
-    private suspend fun requestBrokerWindow(symbol: String, from: LocalDate, to: LocalDate, investorType: String): BrokerWindow? {
+    /**
+     * Stockbit sometimes answers HTTP 200 with an empty broker list when it is throttling
+     * silently. Every date Lumi asks for is a session with traded volume, so an empty answer
+     * is treated like a soft rate limit: the broker lane slows down and the window is retried.
+     */
+    private suspend fun requestNonEmptyBrokerWindow(symbol: String, from: LocalDate, to: LocalDate, investorType: String): BrokerWindow? {
+        repeat(EMPTY_RETRY_DELAYS_MS.size + 1) { attempt ->
+            val (window, raw) = requestBrokerWindow(symbol, from, to, investorType)
+            if (window != null) {
+                if (attempt > 0) emptyRecovered.incrementAndGet()
+                return window
+            }
+            emptyResponses.incrementAndGet()
+            lastEmptySample = "$symbol $from..$to $investorType: ${raw.take(EMPTY_SAMPLE_CHARS)}"
+            if (investorType != "ALL") return null // FOREIGN can be legitimately empty
+            brokerGate.onSoftThrottle()
+            EMPTY_RETRY_DELAYS_MS.getOrNull(attempt)?.let { delay(it + kotlin.random.Random.nextLong(0L, 800L)) }
+        }
+        return null
+    }
+
+    private suspend fun requestBrokerWindow(symbol: String, from: LocalDate, to: LocalDate, investorType: String): Pair<BrokerWindow?, String> {
         val query = StockbitBrokerQuery.build(from, to, investorType)
-        val body = JSONObject(authenticatedGet(
+        val raw = authenticatedGet(
             "https://exodus.stockbit.com/marketdetectors/${URLEncoder.encode(symbol, StandardCharsets.UTF_8.name())}?$query",
             StockbitRequestPriority.BROKER_HISTORY
-        ))
+        )
+        return parseBrokerWindow(raw, to, investorType) to raw
+    }
+
+    private fun parseBrokerWindow(raw: String, to: LocalDate, investorType: String): BrokerWindow? {
+        val body = JSONObject(raw)
         val summary = body.optJSONObject("data")?.optJSONObject("broker_summary") ?: return null
         val buyers = parseBrokerRows(summary.optJSONArray("brokers_buy"), "bval", "netbs_buy_avg_price", false)
         val sellers = parseBrokerRows(summary.optJSONArray("brokers_sell"), "sval", "netbs_sell_avg_price", true)
@@ -1382,7 +1432,9 @@ class StockbitRepository(
         private const val BROKER_DOMINANCE_DEPTH = 5
         private const val DAILY_RESERVE_SESSIONS = 6
         private const val LIVE_WINDOW_TTL_MS = 2 * 60_000L
-        private const val EMPTY_WINDOW_TTL_MS = 12 * 60 * 60_000L
+        private const val EMPTY_WINDOW_TTL_MS = 60_000L
+        private val EMPTY_RETRY_DELAYS_MS = listOf(2_000L, 6_000L, 15_000L)
+        private const val EMPTY_SAMPLE_CHARS = 400
         private const val SETTLED_WINDOW_TTL_MS = 30L * 24 * 60 * 60_000L
         private const val HISTORICAL_PAGE_SIZE = 12
         private const val MAX_HISTORICAL_PAGES = 12

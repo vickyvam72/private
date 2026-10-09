@@ -37,3 +37,15 @@
   parallel with broker history; OHLCVF first-sync pages and market-context reads are concurrent.
 - Diagnostics: run duration, request counts, 429/challenge counts and final broker pacing are
   written to the activity log; duration is shown on the coverage card.
+
+## 1.12.5 hotfix (after first field run)
+
+- Field run showed `NullPointerException` for every *successful* broker detail: the worker stored
+  "complete" as `null` in a `ConcurrentHashMap`, which rejects null values. Outcomes are now
+  `Optional<BrokerFailureKind>`; this was why 0 candidates were saved.
+- 278/315 seeds returned HTTP 200 with an empty broker list. Every requested date has OHLCVF
+  volume, so an empty answer is treated as silent throttling: the broker lane slows down
+  (no hard pause) and the window is retried after 2 s / 6 s / 15 s. Empty windows and EMPTY
+  analyses are never cached (keys moved to `BW3` / `FLOW_V12`). Broker lane: 2 in flight, 350 ms floor.
+- The activity log now reports empty/recovered counts and one raw empty-response sample
+  ("Contoh respons broker kosong Stockbit") so the real Stockbit behaviour can be confirmed.

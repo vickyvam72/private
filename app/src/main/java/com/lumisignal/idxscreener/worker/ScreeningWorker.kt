@@ -116,7 +116,8 @@ class ScreeningWorker(context: Context, params: WorkerParameters) : CoroutineWor
             val detailStarted = AtomicInteger(0)
             val detailChecked = AtomicInteger(0)
             val detailValid = AtomicInteger(0)
-            val detailOutcome = ConcurrentHashMap<String, BrokerFailureKind?>() // null = complete
+            // ConcurrentHashMap rejects null values, so a completed detail is stored as Optional.empty().
+            val detailOutcome = ConcurrentHashMap<String, java.util.Optional<BrokerFailureKind>>()
             val contextLimited = ConcurrentHashMap.newKeySet<String>()
             val enrichedByTicker = ConcurrentHashMap<String, List<Candidate>>()
             val staleSkipped = AtomicInteger(0)
@@ -201,9 +202,9 @@ class ScreeningWorker(context: Context, params: WorkerParameters) : CoroutineWor
                     }
                     if (brokerComplete) {
                         detailValid.incrementAndGet()
-                        detailOutcome[ticker] = null
+                        detailOutcome[ticker] = java.util.Optional.empty()
                     } else {
-                        detailOutcome[ticker] = broker.failureKind ?: BrokerFailureKind.UNKNOWN
+                        detailOutcome[ticker] = java.util.Optional.of(broker.failureKind ?: BrokerFailureKind.UNKNOWN)
                     }
                     if (!contextComplete) contextLimited += ticker
                     enrichedByTicker[ticker] = StrategyEngine.analyze(series, broker, market)
@@ -228,7 +229,7 @@ class ScreeningWorker(context: Context, params: WorkerParameters) : CoroutineWor
                                             throw e
                                         } catch (e: Throwable) {
                                             // One malformed ticker must not abort the market-wide run.
-                                            detailOutcome.putIfAbsent(series.ticker, BrokerFailureKind.UNKNOWN)
+                                            detailOutcome.putIfAbsent(series.ticker, java.util.Optional.of(BrokerFailureKind.UNKNOWN))
                                             repo.log("Analisis broker ${series.ticker} gagal", e.message ?: e.javaClass.simpleName, "WARN")
                                         }
                                     }
@@ -288,7 +289,7 @@ class ScreeningWorker(context: Context, params: WorkerParameters) : CoroutineWor
             val seedValidCount = seedResults.count { it.available }
             val seedFailedCount = activePotential.size - seedValidCount
             val detailTickers = detailOutcome.keys.filter { it in activeTickers }
-            val detailValidCount = detailTickers.count { detailOutcome[it] == null }
+            val detailValidCount = detailTickers.count { detailOutcome[it]?.isPresent == false }
             val detailFailedCount = detailTickers.size - detailValidCount
             val enriched = enrichedByTicker.filterKeys { it in activeTickers }.values.flatten()
 
@@ -306,7 +307,7 @@ class ScreeningWorker(context: Context, params: WorkerParameters) : CoroutineWor
                 val seedKinds = seedResults.filter { !it.available }.map { it.failureKind ?: BrokerFailureKind.UNKNOWN }
                 failureSummary(seedKinds).takeIf { it.isNotBlank() }?.let { add("seed: $it") }
                 if (notAttempted > 0) add("seed belum diproses $notAttempted")
-                failureSummary(detailTickers.mapNotNull { detailOutcome[it] }).takeIf { it.isNotBlank() }?.let { add("detail: $it") }
+                failureSummary(detailTickers.mapNotNull { detailOutcome[it]?.orElse(null) }).takeIf { it.isNotBlank() }?.let { add("detail: $it") }
                 val limited = contextLimited.count { it in activeTickers }
                 if (limited > 0) add("konteks opsional belum lengkap $limited")
             }.joinToString(" • ")
@@ -332,8 +333,12 @@ class ScreeningWorker(context: Context, params: WorkerParameters) : CoroutineWor
                 "$coverage • $duration • ${checked.get()}/${universe.size} OHLCVF • seed $seedValidCount/${activePotential.size} • detail $detailValidCount/${detailTickers.size} • " +
                     "request umum ${traffic.generalCompleted - trafficBefore.generalCompleted}, broker ${traffic.brokerCompleted - trafficBefore.brokerCompleted}, " +
                     "429 ${traffic.rateLimitHits - trafficBefore.rateLimitHits}, challenge ${traffic.challengeHits - trafficBefore.challengeHits}, " +
+                    "kosong ${traffic.emptyResponses - trafficBefore.emptyResponses} (pulih ${traffic.emptyRecovered - trafficBefore.emptyRecovered}), " +
                     "jeda broker ${traffic.brokerSpacingMs}ms • Top [$counts]"
             )
+            if (traffic.emptyResponses > trafficBefore.emptyResponses) {
+                repo.log("Contoh respons broker kosong Stockbit", traffic.lastEmptySample ?: "-", "WARN")
+            }
             return Result.success(stage(finalMessage, checked.get(), universe.size))
         } catch (e: CancellationException) {
             runDao.upsert(run.copy(status = "CANCELLED", completedAt = System.currentTimeMillis(), updatedAt = System.currentTimeMillis(), message = "Screening dibatalkan; cache checkpoint dipertahankan."))

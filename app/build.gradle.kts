@@ -28,8 +28,8 @@ android {
         targetSdk = 35
         // Deliberately monotonic and well above the early test builds so Android
         // cannot silently keep an older APK when installing this release.
-        versionCode = 11204
-        versionName = "1.12.4"
+        versionCode = 11205
+        versionName = "1.12.5"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables.useSupportLibrary = true
     }

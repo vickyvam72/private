@@ -58,11 +58,10 @@ class AppRepository(context: Context) {
     /**
      * Successful analyses are cached per reference session. Failures are never persisted:
      * a transient 429/timeout used to be replayed from cache and inflate the failure count.
-     * Only a genuinely empty broker summary is remembered briefly.
+     * Empty answers are not cached either: Stockbit uses them as a silent throttle.
      */
     private fun brokerCacheTtl(analysis: BrokerAnalysis): Long = when {
         analysis.available -> 7L * 24 * 60 * 60_000
-        analysis.failureKind == BrokerFailureKind.EMPTY -> 30 * 60_000L
         else -> 0L
     }
 
@@ -84,7 +83,7 @@ class AppRepository(context: Context) {
     ): BrokerAnalysis {
         val requestedSessions = dailySessions.coerceIn(10, 20)
         val referenceDate = Instant.ofEpochSecond(referenceEpochSeconds).atZone(JAKARTA).toLocalDate()
-        val key = "${ticker.uppercase()}:$referenceDate:FLOW_V11_DAILY_${requestedSessions}D"
+        val key = "${ticker.uppercase()}:$referenceDate:FLOW_V12_DAILY_${requestedSessions}D"
         db.cacheDao().broker(key, System.currentTimeMillis())?.let { cached ->
             runCatching { CandidateJson.decodeBrokerAnalysis(JSONObject(cached.payload)) }.getOrNull()?.let { return it }
         }
@@ -97,7 +96,7 @@ class AppRepository(context: Context) {
         val dates = sessionEpochSeconds.sorted().takeLast(10)
         if (dates.size < 10) return BrokerAnalysis(false, explanation = listOf("Riwayat sesi untuk broker seed kurang dari 10 hari"), failureKind = BrokerFailureKind.INCOMPLETE)
         val referenceDate = Instant.ofEpochSecond(dates.last()).atZone(JAKARTA).toLocalDate()
-        val key = "${ticker.uppercase()}:$referenceDate:FLOW_V11_SEED_10D"
+        val key = "${ticker.uppercase()}:$referenceDate:FLOW_V12_SEED_10D"
         val now = System.currentTimeMillis()
         db.cacheDao().broker(key, now)?.let { cached ->
             runCatching { CandidateJson.decodeBrokerAnalysis(JSONObject(cached.payload)) }.getOrNull()?.let { return it }
@@ -115,7 +114,7 @@ class AppRepository(context: Context) {
     ): BrokerAnalysis {
         val normalizedPeriods = periods.filter { it in setOf(1, 3, 5, 10) }.toSortedSet()
         val referenceDate = Instant.ofEpochSecond(referenceEpochSeconds).atZone(JAKARTA).toLocalDate()
-        val key = "${ticker.uppercase()}:$referenceDate:FLOW_V11_PERIOD_${normalizedPeriods.joinToString("-")}"
+        val key = "${ticker.uppercase()}:$referenceDate:FLOW_V12_PERIOD_${normalizedPeriods.joinToString("-")}"
         val now = System.currentTimeMillis()
         db.cacheDao().broker(key, now)?.let { cached ->
             runCatching { CandidateJson.decodeBrokerAnalysis(JSONObject(cached.payload)) }.getOrNull()?.let { return it }
